@@ -10,6 +10,673 @@ Requirements:
 
 Compatibility: Python 3.9+
 Platform:      Windows only (uses win32com.client / Outlook COM interface)
+
+pywintypes datetime bug
+-----------------------
+pywin32's win32timezone.utcoffset() can return None when Outlook's timezone
+registry data is incomplete or corrupt.  Any code path that converts a
+pywintypes.datetime to a string — str(), repr(), logging %-formatting,
+pd.DataFrame construction, and datetime.__str__ called by Python's %s
+formatting — will crash with:
+
+    AttributeError: 'NoneType' object has no attribute 'total_seconds'
+
+The fix used throughout this module:
+  _safe_get_received_time() extracts only the raw integer fields (.year,
+  .month, .day, .hour, .minute, .second) from the COM object and
+  reconstructs a plain Python datetime — without ever calling str(),
+  repr(), utcoffset(), or any timezone method.  Four independent fallback
+  strategies are tried so that even pathological COM objects are handled.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from datetime import date as date_type
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
+
+import pandas as pd
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+)
+log = logging.getLogger("outlook_email_parser")
+
+
+# ===========================================================================
+# Internal helpers
+# ===========================================================================
+
+def _extract_int_fields(com_dt) -> datetime:
+    """
+    Reconstruct a plain Python datetime from the raw integer fields of a
+    pywintypes.datetime (or any datetime-like COM object).
+
+    We read ONLY .year / .month / .day / .hour / .minute / .second.
+    We NEVER call str(), repr(), utcoffset(), dst(), or any timezone method —
+    those are the code paths that trigger the win32timezone bug.
+
+    Raises on any failure so the caller can try the next strategy.
+    """
+    return datetime(
+        int(com_dt.year),
+        int(com_dt.month),
+        int(com_dt.day),
+        int(com_dt.hour),
+        int(com_dt.minute),
+        int(com_dt.second),
+    )
+
+
+def _safe_get_received_time(item) -> Optional[datetime]:
+    """
+    Four-strategy approach to extract ReceivedTime as a plain Python datetime.
+
+    Strategy 1 - ReceivedTime integer fields
+        Read .year/.month/.day etc. directly; no string conversion.
+    Strategy 2 - SentOn integer fields
+        Different MAPI property; often works when ReceivedTime fails.
+    Strategy 3 - PR_MESSAGE_DELIVERY_TIME via PropertyAccessor
+        Low-level MAPI property; different COM variant path.
+    Strategy 4 - RFC 2822 Date header
+        Parse the raw transport header string; completely bypasses pywintypes.
+
+    Returns
+    -------
+    Plain Python datetime (timezone-naive) or None.
+    """
+    # Strategy 1: ReceivedTime
+    try:
+        com_dt = item.ReceivedTime
+        if com_dt is not None:
+            return _extract_int_fields(com_dt)
+    except Exception as exc:
+        log.debug("ReceivedTime strategy 1 failed: %s", type(exc).__name__)
+
+    # Strategy 2: SentOn
+    try:
+        com_dt = item.SentOn
+        if com_dt is not None:
+            return _extract_int_fields(com_dt)
+    except Exception as exc:
+        log.debug("ReceivedTime strategy 2 (SentOn) failed: %s", type(exc).__name__)
+
+    # Strategy 3: PropertyAccessor / PR_MESSAGE_DELIVERY_TIME (0x0E060040)
+    try:
+        com_dt = item.PropertyAccessor.GetProperty(
+            "http://schemas.microsoft.com/mapi/proptag/0x0E060040"
+        )
+        if com_dt is not None:
+            return _extract_int_fields(com_dt)
+    except Exception as exc:
+        log.debug("ReceivedTime strategy 3 (PropertyAccessor) failed: %s", type(exc).__name__)
+
+    # Strategy 4: RFC 2822 Date header via transport headers property
+    # PR_TRANSPORT_MESSAGE_HEADERS = 0x007D001E
+    try:
+        import email as _email_mod
+        from email.utils import parsedate_to_datetime as _parsedate
+
+        headers_str = item.PropertyAccessor.GetProperty(
+            "http://schemas.microsoft.com/mapi/proptag/0x007D001E"
+        )
+        if headers_str:
+            parsed_msg = _email_mod.message_from_string(headers_str)
+            date_hdr = parsed_msg.get("Date", "").strip()
+            if date_hdr:
+                dt = _parsedate(date_hdr)
+                # Strip timezone info -> naive local-equivalent datetime
+                return datetime(
+                    dt.year, dt.month, dt.day,
+                    dt.hour, dt.minute, dt.second,
+                )
+    except Exception as exc:
+        log.debug("ReceivedTime strategy 4 (RFC 2822) failed: %s", type(exc).__name__)
+
+    return None
+
+
+def _datetime_to_safe_str(dt: Optional[datetime]) -> str:
+    """
+    Format a plain Python datetime for display in logs or print statements.
+    This is intentionally NEVER called on a pywintypes.datetime object.
+    """
+    if dt is None:
+        return "None"
+    try:
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return "datetime(parse error)"
+
+
+# ===========================================================================
+# 1. Outlook namespace
+# ===========================================================================
+
+def get_outlook_namespace():
+    """
+    Connect to the running Outlook instance via COM and return the MAPI
+    namespace object.
+
+    Raises
+    ------
+    ImportError  – pywin32 not installed.
+    RuntimeError – Outlook not running or not connectable.
+    """
+    try:
+        import win32com.client  # type: ignore
+    except ImportError as exc:
+        raise ImportError(
+            "pywin32 is required.  Install with:  pip install pywin32"
+        ) from exc
+
+    try:
+        outlook = win32com.client.Dispatch("Outlook.Application")
+        namespace = outlook.GetNamespace("MAPI")
+        return namespace
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not connect to Outlook.  Make sure Outlook is open. Error: {exc}"
+        ) from exc
+
+
+# ===========================================================================
+# 2. Folder navigation
+# ===========================================================================
+
+def get_folder(
+    namespace,
+    folder_path: Tuple[str, ...],
+    mailbox_name: Optional[str] = None,
+):
+    """
+    Traverse a nested folder path inside Outlook and return the target folder.
+
+    Parameters
+    ----------
+    namespace     : MAPI namespace from get_outlook_namespace().
+    folder_path   : Ordered tuple of folder names,
+                    e.g. ("Inbox", "MCBox", "Trades", "EMail").
+    mailbox_name  : Display name of shared/delegate mailbox.
+                    None => use the default store.
+
+    Returns
+    -------
+    Outlook Folder COM object.
+    """
+    if not folder_path:
+        raise ValueError("folder_path must contain at least one folder name.")
+
+    if mailbox_name:
+        root = None
+        for store in namespace.Stores:
+            try:
+                if store.DisplayName.strip().lower() == mailbox_name.strip().lower():
+                    root = store.GetRootFolder()
+                    break
+            except Exception:
+                continue
+        if root is None:
+            available = []
+            for store in namespace.Stores:
+                try:
+                    available.append(store.DisplayName)
+                except Exception:
+                    pass
+            raise KeyError(
+                f"Mailbox '{mailbox_name}' not found.  Available: {available}"
+            )
+    else:
+        root = namespace.DefaultStore.GetRootFolder()
+
+    current_folder = root
+    for segment in folder_path:
+        sub_folders = current_folder.Folders
+        matched = None
+        for i in range(1, sub_folders.Count + 1):
+            try:
+                sf = sub_folders.Item(i)
+                if sf.Name.strip().lower() == segment.strip().lower():
+                    matched = sf
+                    break
+            except Exception:
+                continue
+
+        if matched is None:
+            available = []
+            for i in range(1, sub_folders.Count + 1):
+                try:
+                    available.append(sub_folders.Item(i).Name)
+                except Exception:
+                    pass
+            raise KeyError(
+                f"Sub-folder '{segment}' not found under "
+                f"'{current_folder.Name}'.  Available: {available}"
+            )
+        current_folder = matched
+
+    log.info("Resolved folder: %s", " > ".join(folder_path))
+    return current_folder
+
+
+# ===========================================================================
+# 3. Fetch messages from a specific day
+# ===========================================================================
+
+def fetch_messages_from_day(
+    folder,
+    days_ago: int,
+    reference_date: Optional[datetime] = None,
+) -> List:
+    """
+    Return all MailItem objects whose ReceivedTime falls on the calendar day
+    exactly ``days_ago`` days before ``reference_date``.
+
+    Filtering is done entirely in Python — no Restrict() — to avoid DASL
+    locale/timezone pitfalls and the pywintypes total_seconds bug.
+
+    Parameters
+    ----------
+    folder         : Outlook Folder COM object.
+    days_ago       : Calendar days back (0=today, 1=yesterday, …).
+    reference_date : Anchor date; defaults to datetime.now().
+
+    Returns
+    -------
+    List of Outlook MailItem COM objects.
+    """
+    if reference_date is None:
+        reference_date = datetime.now()
+
+    target_date: date_type = (reference_date - timedelta(days=days_ago)).date()
+    log.info("Filtering emails received on: %s", target_date.isoformat())
+
+    mail_items: List = []
+    items = folder.Items
+    total: int = items.Count
+    log.info("Total items in folder: %d", total)
+
+    for i in range(1, total + 1):
+        try:
+            item = items.Item(i)
+        except Exception as exc:
+            log.warning("Could not access folder item %d: %s", i, exc)
+            continue
+
+        # Only genuine mail items (OlItemType 43 = olMailItem)
+        try:
+            if item.Class != 43:
+                continue
+        except Exception:
+            continue
+
+        # _safe_get_received_time returns a plain Python datetime or None.
+        # The raw COM object is NEVER passed to str(), log, or comparisons.
+        received_py: Optional[datetime] = _safe_get_received_time(item)
+        if received_py is None:
+            log.debug("Item %d: all ReceivedTime strategies failed - skipping.", i)
+            continue
+
+        if received_py.date() == target_date:
+            mail_items.append(item)
+
+    log.info(
+        "Found %d matching mail item(s) for %s.",
+        len(mail_items),
+        target_date.isoformat(),
+    )
+    return mail_items
+
+
+# ===========================================================================
+# 4. HTML table extraction
+# ===========================================================================
+
+def try_read_html_tables(html_body: str) -> List[pd.DataFrame]:
+    """
+    Attempt to parse all HTML tables from ``html_body``.
+
+    Returns a (possibly empty) list of raw DataFrames.
+    Malformed or empty tables are silently skipped.
+    """
+    if not html_body or not html_body.strip():
+        return []
+
+    tables: List[pd.DataFrame] = []
+    for flavor in ("lxml", "html5lib"):
+        try:
+            tables = pd.read_html(html_body, flavor=flavor)
+            break
+        except Exception:
+            continue
+
+    valid: List[pd.DataFrame] = []
+    for df in tables:
+        if df is None or df.empty:
+            continue
+        if df.shape[0] < 1 or df.shape[1] < 2:
+            continue
+        valid.append(df)
+
+    return valid
+
+
+# ===========================================================================
+# 5. Table normalisation
+# ===========================================================================
+
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _clean_column_name(raw: str) -> str:
+    """Lowercase, strip, collapse inner whitespace to underscores."""
+    s = str(raw).strip()
+    s = _WHITESPACE_RE.sub("_", s)
+    return s.lower()
+
+
+def normalize_table(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    """
+    Normalise a raw DataFrame from try_read_html_tables.
+
+    Assumes layout:
+        column 0  = attribute / field names
+        column 1+ = one security per column
+
+    Returns normalised DataFrame or None if unusable.
+    """
+    df = df.dropna(axis=1, how="all").dropna(axis=0, how="all")
+
+    if df.empty or df.shape[1] < 2:
+        return None
+
+    df = df.reset_index(drop=True)
+    df.columns = list(range(df.shape[1]))
+    df = df.fillna("")
+    df = df.astype(str)
+    df = df.applymap(lambda x: x.strip())  # type: ignore[attr-defined]
+
+    return df
+
+
+# ===========================================================================
+# 6. Convert one normalised table -> security rows
+# ===========================================================================
+
+def table_to_security_rows(
+    df: pd.DataFrame,
+    table_index: int,
+    email_meta: Dict,
+) -> List[Dict]:
+    """
+    Convert a normalised table into a list of flat row dicts, one per
+    security column.
+
+    column 0   = attribute names  (become output column headers)
+    column 1..N = one security each (become output rows)
+
+    If the attribute name for row 0 is blank, that row is treated as a
+    header row for the security columns (e.g. ISIN / ticker).
+
+    Parameters
+    ----------
+    df          : Normalised DataFrame from normalize_table().
+    table_index : Zero-based position of this table within the email.
+    email_meta  : Dict with keys entry_id, subject, received_time.
+
+    Returns
+    -------
+    List of dicts, one per security.
+    """
+    rows: List[Dict] = []
+    attr_col: List[str] = df[0].tolist()
+    num_security_cols: int = df.shape[1] - 1
+
+    norm_attrs: List[str] = [
+        _clean_column_name(a) if a.strip() else f"field_{i}"
+        for i, a in enumerate(attr_col)
+    ]
+
+    security_headers: List[str] = [""] * num_security_cols
+    data_start_row: int = 0
+
+    if attr_col and not attr_col[0].strip():
+        for col_idx in range(1, df.shape[1]):
+            security_headers[col_idx - 1] = str(df.iloc[0, col_idx]).strip()
+        data_start_row = 1
+
+    for sec_idx in range(num_security_cols):
+        col_idx = sec_idx + 1
+
+        record: Dict = {
+            **email_meta,
+            "table_index": table_index,
+            "security_index": sec_idx,
+            "security_header": security_headers[sec_idx],
+        }
+
+        for row_idx in range(data_start_row, len(attr_col)):
+            attr_name = norm_attrs[row_idx] or f"field_{row_idx}"
+            try:
+                value = df.iloc[row_idx, col_idx]
+            except IndexError:
+                value = ""
+            record[attr_name] = value
+
+        rows.append(record)
+
+    return rows
+
+
+# ===========================================================================
+# 7. Main orchestration
+# ===========================================================================
+
+def parse_outlook_folder_to_dataframe(
+    folder_path: Tuple[str, ...],
+    days_ago: int,
+    mailbox_name: Optional[str] = None,
+    reference_date: Optional[datetime] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    High-level entry point.
+
+    Connects to Outlook, resolves the folder, fetches emails from
+    ``days_ago`` days back, parses HTML tables, and consolidates
+    everything into one output DataFrame.
+
+    Parameters
+    ----------
+    folder_path    : Tuple of nested folder names,
+                     e.g. ("Inbox", "MCBox", "Trades", "EMail").
+    days_ago       : Calendar days back (0=today, 1=yesterday, ...).
+    mailbox_name   : Optional shared/delegate mailbox display name.
+    reference_date : Override anchor date (defaults to datetime.now()).
+
+    Returns
+    -------
+    (results_df, summary_df)
+
+    results_df
+        One row per security per table per email.  Columns include email
+        metadata (entry_id, subject, received_time, table_index,
+        security_index, security_header) plus all normalised attribute
+        columns parsed from the tables.
+
+    summary_df
+        One row per processed email: entry_id, subject, received_time,
+        tables_found, tables_parsed, total_security_rows.
+    """
+    namespace = get_outlook_namespace()
+    folder = get_folder(namespace, folder_path, mailbox_name=mailbox_name)
+    messages = fetch_messages_from_day(
+        folder, days_ago, reference_date=reference_date
+    )
+
+    all_rows: List[Dict] = []
+    summary_rows: List[Dict] = []
+
+    for msg in messages:
+        # ---- metadata ------------------------------------------------------
+        try:
+            entry_id: str = msg.EntryID or ""
+        except Exception:
+            entry_id = ""
+
+        try:
+            subject: str = msg.Subject or ""
+        except Exception:
+            subject = ""
+
+        # Use _safe_get_received_time.
+        # The raw COM datetime object is NEVER assigned to a variable that
+        # is passed to str(), log formatting, or pd.DataFrame().
+        received_time: Optional[datetime] = _safe_get_received_time(msg)
+
+        # _datetime_to_safe_str operates only on plain Python datetime / None.
+        log.info(
+            "Processing: '%s' received %s",
+            subject,
+            _datetime_to_safe_str(received_time),
+        )
+
+        email_meta: Dict = {
+            "entry_id": entry_id,
+            "subject": subject,
+            # Plain Python datetime or None - safe for pandas and CSV export.
+            "received_time": received_time,
+        }
+
+        # ---- HTML body -----------------------------------------------------
+        try:
+            html_body: str = msg.HTMLBody or ""
+        except Exception:
+            html_body = ""
+
+        if not html_body.strip():
+            log.debug("  No HTML body - skipping table parsing.")
+            summary_rows.append(
+                {
+                    **email_meta,
+                    "tables_found": 0,
+                    "tables_parsed": 0,
+                    "total_security_rows": 0,
+                }
+            )
+            continue
+
+        # ---- parse tables --------------------------------------------------
+        raw_tables = try_read_html_tables(html_body)
+        tables_found: int = len(raw_tables)
+        tables_parsed: int = 0
+        security_rows_count: int = 0
+
+        for tbl_idx, raw_df in enumerate(raw_tables):
+            norm_df = normalize_table(raw_df)
+            if norm_df is None:
+                log.debug("  Table %d: could not normalise - skipping.", tbl_idx)
+                continue
+
+            sec_rows = table_to_security_rows(norm_df, tbl_idx, email_meta)
+            if sec_rows:
+                all_rows.extend(sec_rows)
+                tables_parsed += 1
+                security_rows_count += len(sec_rows)
+                log.debug(
+                    "  Table %d: %d security row(s) extracted.",
+                    tbl_idx,
+                    len(sec_rows),
+                )
+
+        summary_rows.append(
+            {
+                **email_meta,
+                "tables_found": tables_found,
+                "tables_parsed": tables_parsed,
+                "total_security_rows": security_rows_count,
+            }
+        )
+
+    # ---- assemble DataFrames -----------------------------------------------
+    _RESULT_COLS = [
+        "entry_id", "subject", "received_time",
+        "table_index", "security_index", "security_header",
+    ]
+    _SUMMARY_COLS = [
+        "entry_id", "subject", "received_time",
+        "tables_found", "tables_parsed", "total_security_rows",
+    ]
+
+    results_df = (
+        pd.DataFrame(all_rows) if all_rows
+        else pd.DataFrame(columns=_RESULT_COLS)
+    )
+    summary_df = (
+        pd.DataFrame(summary_rows) if summary_rows
+        else pd.DataFrame(columns=_SUMMARY_COLS)
+    )
+
+    log.info(
+        "Done.  %d email(s) processed, %d total output row(s).",
+        len(summary_rows),
+        len(all_rows),
+    )
+    return results_df, summary_df
+
+
+# ===========================================================================
+# 8. CLI entry point
+# ===========================================================================
+
+if __name__ == "__main__":
+    # -----------------------------------------------------------------------
+    # CONFIG - edit these values before running
+    # -----------------------------------------------------------------------
+    CONFIG: Dict = {
+        # Nested folder path inside Outlook
+        "folder_path": ("Inbox", "MCBox", "Trades", "EMail"),
+
+        # How many days back (0 = today, 1 = yesterday, ...)
+        "days_ago": 1,
+
+        # None  -> your default / primary mailbox
+        # str   -> shared mailbox display name, e.g. "shared@company.com"
+        "mailbox_name": None,
+    }
+    # -----------------------------------------------------------------------
+
+    results, summary = parse_outlook_folder_to_dataframe(
+        folder_path=CONFIG["folder_path"],
+        days_ago=CONFIG["days_ago"],
+        mailbox_name=CONFIG["mailbox_name"],
+    )
+
+    print("\n========== SUMMARY ==========")
+    print(summary.to_string(index=False))
+
+    print("\n========== RESULTS (first 10 rows) ==========")
+    print(results.head(10).to_string(index=False))
+
+    # Optionally save to CSV
+    # results.to_csv("parsed_securities.csv", index=False)
+    # summary.to_csv("email_summary.csv", index=False)"""
+outlook_email_parser.py
+-----------------------
+Reads emails from a specific Microsoft Outlook folder, filters by received date
+(exactly X days ago), parses HTML tables from each matching email, and returns
+all parsed rows as a single consolidated pandas DataFrame.
+
+Requirements:
+    pip install pywin32 pandas lxml html5lib beautifulsoup4
+
+Compatibility: Python 3.9+
+Platform:      Windows only (uses win32com.client / Outlook COM interface)
 """
 
 from __future__ import annotations
