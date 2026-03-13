@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from io import StringIO
-from typing import Any
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -17,14 +17,14 @@ except ImportError as exc:  # pragma: no cover - import failure is environment-s
 
 @dataclass
 class OutlookTableParserConfig:
-    mailbox: str | None = None
-    folder_path: tuple[str, ...] = ("Inbox",)
+    mailbox: Optional[str] = None
+    folder_path: Tuple[str, ...] = ("Inbox",)
     days_ago: int = 1
-    outlook_profile: str | None = None
+    outlook_profile: Optional[str] = None
     include_empty_tables: bool = False
 
 
-def get_outlook_namespace(profile_name: str | None = None) -> Any:
+def get_outlook_namespace(profile_name: Optional[str] = None) -> Any:
     outlook = win32com.client.Dispatch("Outlook.Application")
     namespace = outlook.GetNamespace("MAPI")
     if profile_name:
@@ -32,7 +32,7 @@ def get_outlook_namespace(profile_name: str | None = None) -> Any:
     return namespace
 
 
-def get_folder(namespace: Any, mailbox: str | None, folder_path: tuple[str, ...]) -> Any:
+def get_folder(namespace: Any, mailbox: Optional[str], folder_path: Tuple[str, ...]) -> Any:
     if not folder_path:
         raise ValueError("folder_path must contain at least one folder name")
 
@@ -58,7 +58,7 @@ def get_folder(namespace: Any, mailbox: str | None, folder_path: tuple[str, ...]
     return folder
 
 
-def get_day_bounds(days_ago: int) -> tuple[datetime, datetime]:
+def get_day_bounds(days_ago: int) -> Tuple[datetime, datetime]:
     if days_ago < 0:
         raise ValueError("days_ago must be >= 0")
 
@@ -73,7 +73,7 @@ def format_outlook_datetime(dt: datetime) -> str:
     return dt.strftime("%m/%d/%Y %I:%M %p")
 
 
-def fetch_messages_from_day(folder: Any, days_ago: int) -> list[Any]:
+def fetch_messages_from_day(folder: Any, days_ago: int) -> List[Any]:
     start, end = get_day_bounds(days_ago)
     items = folder.Items
     items.Sort("[ReceivedTime]", True)
@@ -85,7 +85,7 @@ def fetch_messages_from_day(folder: Any, days_ago: int) -> list[Any]:
     return [item for item in restricted if getattr(item, "Class", None) == 43]
 
 
-def try_read_html_tables(html: str) -> list[pd.DataFrame]:
+def try_read_html_tables(html: str) -> List[pd.DataFrame]:
     if not html or "<table" not in html.lower():
         return []
 
@@ -94,7 +94,7 @@ def try_read_html_tables(html: str) -> list[pd.DataFrame]:
     except ValueError:
         return []
 
-    cleaned: list[pd.DataFrame] = []
+    cleaned: List[pd.DataFrame] = []
     for table in tables:
         normalized = normalize_table(table)
         if normalized is not None:
@@ -102,7 +102,7 @@ def try_read_html_tables(html: str) -> list[pd.DataFrame]:
     return cleaned
 
 
-def normalize_table(table: pd.DataFrame) -> pd.DataFrame | None:
+def normalize_table(table: pd.DataFrame) -> Optional[pd.DataFrame]:
     if table.empty or table.shape[1] < 2:
         return None
 
@@ -143,9 +143,9 @@ def table_to_security_rows(
     received_time: datetime,
     entry_id: str,
     table_index: int,
-) -> list[dict[str, Any]]:
+) -> List[Dict[str, Any]]:
     attribute_series = table.iloc[:, 0].astype(str).str.strip()
-    records: list[dict[str, Any]] = []
+    records: List[Dict[str, Any]] = []
 
     for security_position in range(1, table.shape[1]):
         security_values = table.iloc[:, security_position]
@@ -173,7 +173,7 @@ def table_to_security_rows(
     return records
 
 
-def infer_security_header(value: Any) -> str | None:
+def infer_security_header(value: Any) -> Optional[str]:
     if value is None:
         return None
 
@@ -192,13 +192,13 @@ def make_column_name(value: str) -> str:
 
 def parse_outlook_folder_to_dataframe(
     config: OutlookTableParserConfig,
-) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
+) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
     namespace = get_outlook_namespace(config.outlook_profile)
     folder = get_folder(namespace, config.mailbox, config.folder_path)
     messages = fetch_messages_from_day(folder, config.days_ago)
 
-    parsed_rows: list[dict[str, Any]] = []
-    message_summaries: list[dict[str, Any]] = []
+    parsed_rows: List[Dict[str, Any]] = []
+    message_summaries: List[Dict[str, Any]] = []
 
     for message in messages:
         subject = getattr(message, "Subject", "") or ""
