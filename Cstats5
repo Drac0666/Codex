@@ -148,6 +148,333 @@ def write_pivot_sheet(wb_out, ws_title, metric, all_data, sorted_dates, bg):
     for col_idx, h in enumerate(headers, 1):
         style_header(ws.cell(row=1, column=col_idx, value=h), bg=bg)
 
+    # For each deal, only forward-fill between its first and last reported date
+    # Dates before first report or after last report stay empty
+    deal_reporting_bounds = {}
+    for sheet_name in deal_names:
+        deal_dates = all_data[sheet_name]["data"][metric]
+        reported = [d for d in sorted_dates if d in deal_dates]
+        if reported:
+            deal_reporting_bounds[sheet_name] = (reported[0], reported[-1])
+        else:
+            deal_reporting_bounds[sheet_name] = (None, None)
+
+    last_known = {sheet_name: None for sheet_name in deal_names}
+
+    for row_idx, date in enumerate(sorted_dates, 2):
+        ws.cell(row=row_idx, column=1, value=date)
+        for col_idx, sheet_name in enumerate(deal_names, 2):
+            deal_dates = all_data[sheet_name]["data"][metric]
+            first_date, last_date = deal_reporting_bounds[sheet_name]
+
+            if date in deal_dates:
+                # Real reported value — use it and update last known
+                val = deal_dates[date]
+                last_known[sheet_name] = val
+            elif (first_date is not None
+                  and parse_date_key(first_date) <= parse_date_key(date) <= parse_date_key(last_date)):
+                # Gap between first and last report — forward-fill
+                val = last_known[sheet_name]
+            else:
+                # Before first report or after last report — leave empty
+                val = None
+
+            ws.cell(row=row_idx, column=col_idx, value=val)
+
+    auto_width(ws, headers, min_width=14)
+
+
+# ── OUTPUT ────────────────────────────────────────────────────────────────────
+def write_output(all_data: dict):
+    wb_out = openpyxl.Workbook()
+
+    # ── 1. AGGREGATED sheet ───────────────────────────────────────────────────
+    # Columns: Sheet | Date | Delinq 30+ | Delinq 90+
+    # One row per (sheet, date) combination.
+    ws_agg = wb_out.active
+    ws_agg.title = "Aggregated"
+
+    agg_headers = ["Sheet", "Date", "Delinq 30+", "Delinq 90+"]
+    for col_idx, h in enumerate(agg_headers, 1):
+        style_header(ws_agg.cell(row=1, column=col_idx, value=h))
+
+    agg_row = 2
+    for sheet_name, result in all_data.items():
+        if not result.get("data"):
+            continue
+        dates      = result["dates"]
+        d30_values = result["data"].get("Delinq 30+", {})
+        d90_values = result["data"].get("Delinq 90+", {})
+
+        for date in dates:
+            ws_agg.cell(row=agg_row, column=1, value=sheet_name)
+            ws_agg.cell(row=agg_row, column=2, value=date)
+            ws_agg.cell(row=agg_row, column=3, value=d30_values.get(date))
+            ws_agg.cell(row=agg_row, column=4, value=d90_values.get(date))
+            agg_row += 1
+
+    auto_width(ws_agg, agg_headers, min_width=14)
+
+    # ── 2. SUMMARY sheet (wide format) ────────────────────────────────────────
+    # Columns: Sheet | Metric | <date1> | <date2> | ...
+    ws_sum = wb_out.create_sheet("Summary")
+
+    seen_dates = []
+    for result in all_data.values():
+        for d in result.get("dates", []):
+            if d not in seen_dates:
+                seen_dates.append(d)
+
+    sum_headers = ["Sheet", "Metric"] + seen_dates
+    for col_idx, h in enumerate(sum_headers, 1):
+        style_header(ws_sum.cell(row=1, column=col_idx, value=h), bg="70AD47")
+
+    sum_row = 2
+    for sheet_name, result in all_data.items():
+        if not result.get("data"):
+            continue
+        for metric, values in result["data"].items():
+            ws_sum.cell(row=sum_row, column=1, value=sheet_name)
+            ws_sum.cell(row=sum_row, column=2, value=metric)
+            for col_idx, date in enumerate(seen_dates, 3):
+                ws_sum.cell(row=sum_row, column=col_idx, value=values.get(date))
+            sum_row += 1
+
+    auto_width(ws_sum, sum_headers, min_width=14)
+
+    # ── 3. One tab per source sheet ───────────────────────────────────────────
+    for sheet_name, result in all_data.items():
+        if not result.get("data"):
+            continue
+
+        safe_name = sheet_name[:31]
+        ws = wb_out.create_sheet(title=safe_name)
+
+        dates       = result["dates"]
+        col_headers = ["Metric", "Source Row"] + dates
+        for col_idx, h in enumerate(col_headers, 1):
+            style_header(ws.cell(row=1, column=col_idx, value=h), bg="ED7D31")
+
+        for row_idx, (metric, values) in enumerate(result["data"].items(), 2):
+            ws.cell(row=row_idx, column=1, value=metric)
+            ws.cell(row=row_idx, column=2, value=result["row_numbers"].get(metric))
+            for col_idx, date in enumerate(dates, 3):
+                ws.cell(row=row_idx, column=col_idx, value=values.get(date))
+
+        auto_width(ws, col_headers, min_width=12)
+
+    # ── 4. Collect all unique dates across all sheets, sorted oldest→newest ──
+    all_dates_set = set()
+    for result in all_data.values():
+        all_dates_set.update(result.get("dates", []))
+    sorted_dates = sorted(all_dates_set, key=parse_date_key)
+
+    # ── 5. PIVOT: Delinq 30+ (dates as rows, deals as columns) ───────────────
+    write_pivot_sheet(wb_out, "Delinq 30+ by Deal", "Delinq 30+",
+                      all_data, sorted_dates, bg="4472C4")
+
+    # ── 6. PIVOT: Delinq 90+ (dates as rows, deals as columns) ───────────────
+    write_pivot_sheet(wb_out, "Delinq 90+ by Deal", "Delinq 90+",
+                      all_data, sorted_dates, bg="C00000")
+
+    wb_out.save(OUTPUT_FILE)
+    print(f"\n✅  Saved -> {OUTPUT_FILE}")
+
+
+# ── MAIN ──────────────────────────────────────────────────────────────────────
+def main():
+    path = Path(INPUT_FILE)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Cannot find '{INPUT_FILE}'. "
+            "Place this script in the same folder as the Excel file, or update INPUT_FILE."
+        )
+
+    print(f"Opening: {path.resolve()}")
+    wb = load_workbook(path, read_only=True, data_only=True)
+    print(f"Sheets found: {wb.sheetnames}\n")
+
+    all_data = {}
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        print(f"Processing sheet: {sheet_name} ...", end=" ")
+        result = extract_sheet(ws)
+        all_data[sheet_name] = result
+        if result.get("data"):
+            for metric, row_num in result["row_numbers"].items():
+                print(f"\n    Found '{metric}' at row {row_num} | "
+                      f"{len(result['data'][metric])} date columns")
+        else:
+            print("  (no Delinq rows found)")
+
+    write_output(all_data)
+
+    # ── Console preview ───────────────────────────────────────────────────────
+    print("\n--- AGGREGATED PREVIEW ---")
+    print(f"{'Sheet':<25} {'Date':<12} {'Delinq 30+':>12} {'Delinq 90+':>12}")
+    print("-" * 65)
+    for sheet_name, result in all_data.items():
+        if not result.get("data"):
+            continue
+        d30 = result["data"].get("Delinq 30+", {})
+        d90 = result["data"].get("Delinq 90+", {})
+        for date in result["dates"]:
+            print(f"{sheet_name:<25} {date:<12} "
+                  f"{str(d30.get(date, '')):>12} {str(d90.get(date, '')):>12}")
+
+
+if __name__ == "__main__":
+    main()
+"""
+extract_delinq.py
+-----------------
+Extracts Delinq 30+ and Delinq 90+ values from EuropeanCStats.xlsx.
+
+Structure assumed (per sheet):
+  - Row 18        : column headers (col D onwards = date labels, e.g. "Feb 26", "Nov 25", ...)
+  - Column A      : metric labels (exact match: "Delinq 30+" or "Delinq 90+" only)
+  - Columns D+    : values for those metrics; "-" is treated as 0
+
+Outputs:
+  extracted_delinq.xlsx
+    - "Aggregated"  : Sheet | Date | Delinq 30+ | Delinq 90+   (one row per sheet+date)
+    - "Summary"     : Sheet | Metric | <date1> | <date2> | ... (wide format)
+    - one tab per source sheet
+
+Requirements:
+    pip install openpyxl
+"""
+
+from pathlib import Path
+import openpyxl
+from openpyxl import load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
+
+# ── CONFIG ────────────────────────────────────────────────────────────────────
+INPUT_FILE     = "EuropeanCStats.xlsx"
+OUTPUT_FILE    = "extracted_delinq.xlsx"
+HEADER_ROW     = 18        # row that contains date labels
+DATA_START_COL = 4         # column D = index 4 (1-based in openpyxl)
+TARGETS        = {"Delinq 30+", "Delinq 90+"}   # exact, case-sensitive
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def clean_value(val):
+    """Convert '-' to 0; leave everything else as-is."""
+    if val is None:
+        return None
+    if str(val).strip() == "-":
+        return 0
+    return val
+
+
+def col_letter(idx_1based: int) -> str:
+    return get_column_letter(idx_1based)
+
+
+def style_header(cell, bg="4472C4"):
+    cell.font      = Font(bold=True, color="FFFFFF")
+    cell.fill      = PatternFill("solid", fgColor=bg)
+    cell.alignment = Alignment(horizontal="center")
+
+
+def auto_width(ws, headers, start_col=1, min_width=14):
+    for i, h in enumerate(headers, start_col):
+        ws.column_dimensions[col_letter(i)].width = max(len(str(h)) + 4, min_width)
+
+
+# ── EXTRACTION ────────────────────────────────────────────────────────────────
+def extract_sheet(ws) -> dict:
+    """
+    Returns:
+        {
+          "dates":  ["Feb 26", "Nov 25", ...],
+          "data":   {
+              "Delinq 30+": {"Feb 26": 0.023, ...},
+              "Delinq 90+": {"Feb 26": 0.011, ...},
+          },
+          "row_numbers": {"Delinq 30+": 22, "Delinq 90+": 25}
+        }
+    """
+    all_rows = list(ws.iter_rows(values_only=True))
+
+    if len(all_rows) < HEADER_ROW:
+        return {}
+
+    header_row_data = all_rows[HEADER_ROW - 1]   # 0-based
+
+    # Collect date labels from col D onwards (skip None gaps, don't stop early)
+    dates            = []
+    date_col_indices = []
+    for col_idx in range(DATA_START_COL - 1, len(header_row_data)):
+        val = header_row_data[col_idx]
+        if val is not None:
+            dates.append(str(val).strip())
+            date_col_indices.append(col_idx)
+
+    result = {"dates": dates, "data": {}, "row_numbers": {}}
+
+    for row_idx, row in enumerate(all_rows):
+        raw_col_a = str(row[0]).strip() if row[0] is not None else ""
+
+        if raw_col_a not in TARGETS:        # exact match only
+            continue
+
+        matched_label = raw_col_a
+
+        if matched_label in result["data"]:  # keep first occurrence
+            continue
+
+        row_values = {}
+        for date_label, col_idx in zip(dates, date_col_indices):
+            raw = row[col_idx] if col_idx < len(row) else None
+            row_values[date_label] = clean_value(raw)
+
+        result["data"][matched_label]        = row_values
+        result["row_numbers"][matched_label] = row_idx + 1
+
+    return result
+
+
+MONTH_ORDER = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12
+}
+
+def parse_date_key(date_str: str):
+    """
+    Turn "Feb 26" or "Feb-26" into a sortable (year, month) tuple.
+    Two-digit years: 00-49 -> 2000-2049, 50-99 -> 1950-1999.
+    Returns (9999, 99) on failure so unparseable dates sort last.
+    """
+    parts = date_str.replace("-", " ").split()
+    if len(parts) != 2:
+        return (9999, 99)
+    month_str, year_str = parts[0].lower()[:3], parts[1]
+    month = MONTH_ORDER.get(month_str, 99)
+    try:
+        yr = int(year_str)
+        year = 2000 + yr if yr < 50 else 1900 + yr
+    except ValueError:
+        year = 9999
+    return (year, month)
+
+
+def write_pivot_sheet(wb_out, ws_title, metric, all_data, sorted_dates, bg):
+    """
+    Rows = dates (oldest first), Columns = one per deal/sheet.
+    Col A = Date, then one column per sheet that has the metric.
+    """
+    ws = wb_out.create_sheet(ws_title)
+
+    # Only include sheets that actually have this metric
+    deal_names = [s for s, r in all_data.items() if metric in r.get("data", {})]
+
+    headers = ["Date"] + deal_names
+    for col_idx, h in enumerate(headers, 1):
+        style_header(ws.cell(row=1, column=col_idx, value=h), bg=bg)
+
     # Track last known value per deal for forward-filling gaps
     last_known = {sheet_name: None for sheet_name in deal_names}
 
