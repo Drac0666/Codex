@@ -1,0 +1,122 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import List, Dict, Any
+
+import pandas as pd
+from openpyxl import load_workbook
+
+
+def extract_delinquency_metrics(
+    file_path: str | Path,
+    header_row: int = 18,
+    start_col: int = 4,
+    target_labels: tuple[str, ...] = ("Delinq 30+", "Delinq 90+"),
+) -> pd.DataFrame:
+    """
+    Read an XLSX file with multiple sheets and extract values for:
+      - Delinq 30+
+      - Delinq 90+
+
+    Logic:
+      - Search column A for rows containing the target labels
+      - Use row `header_row` as the source of period labels
+      - Starting from column `start_col` (D=4), extract all non-empty values
+        under each period for the matching rows
+
+    Parameters
+    ----------
+    file_path : str | Path
+        Path to the Excel file.
+    header_row : int
+        Excel row number containing the date/period headers. Default = 18.
+    start_col : int
+        Excel column number where metric values start. Default = 4 (column D).
+    target_labels : tuple[str, ...]
+        Metric labels to search for in column A.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns:
+        - sheet_name
+        - metric
+        - metric_row
+        - period
+        - value
+    """
+    file_path = Path(file_path)
+
+    wb = load_workbook(filename=file_path, data_only=True)
+
+    results: List[Dict[str, Any]] = []
+
+    # normalize targets for easier matching
+    target_map = {label.lower().strip(): label for label in target_labels}
+
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+
+        max_row = ws.max_row
+        max_col = ws.max_column
+
+        # Read headers from row 18, starting at column D
+        headers = {}
+        for col_idx in range(start_col, max_col + 1):
+            header_value = ws.cell(row=header_row, column=col_idx).value
+            if header_value is not None and str(header_value).strip() != "":
+                headers[col_idx] = header_value
+
+        # Search column A for target labels
+        for row_idx in range(1, max_row + 1):
+            col_a_value = ws.cell(row=row_idx, column=1).value
+
+            if col_a_value is None:
+                continue
+
+            label_text = str(col_a_value).strip()
+            label_text_lower = label_text.lower()
+
+            matched_metric = None
+            for target_lower, original_target in target_map.items():
+                if target_lower in label_text_lower:
+                    matched_metric = original_target
+                    break
+
+            if not matched_metric:
+                continue
+
+            # Extract values from D onward using headers from row 18
+            for col_idx, period in headers.items():
+                value = ws.cell(row=row_idx, column=col_idx).value
+
+                # keep only cells that actually contain something
+                if value is None or str(value).strip() == "":
+                    continue
+
+                results.append(
+                    {
+                        "sheet_name": sheet_name,
+                        "metric": matched_metric,
+                        "metric_row": row_idx,
+                        "period": period,
+                        "value": value,
+                    }
+                )
+
+    return pd.DataFrame(results)
+
+
+if __name__ == "__main__":
+    # Put your file path here
+    file_path = r"C:\path\to\your\file.xlsx"
+
+    df = extract_delinquency_metrics(file_path)
+
+    print(df)
+
+    # Optional: save result
+    output_path = Path(file_path).with_name("delinq_extracted.xlsx")
+    df.to_excel(output_path, index=False)
+
+    print(f"\nSaved output to: {output_path}")
