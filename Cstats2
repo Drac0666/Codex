@@ -75,6 +75,221 @@ def extract_sheet(ws) -> dict:
         col_a = normalise(row[0])
         matched_label = None
         for target in TARGETS:
+            if col_a == target:          # exact match only
+                matched_label = str(row[0]).strip()
+                break
+        if matched_label is None:
+            continue
+
+        row_values = {}
+        for date_label, col_idx in zip(dates, date_col_indices):
+            if col_idx < len(row):
+                row_values[date_label] = row[col_idx]
+            else:
+                row_values[date_label] = None
+
+        # If the same label appears twice in a sheet, keep the first occurrence
+        if matched_label not in result["data"]:
+            result["data"][matched_label] = row_values
+            result["row_numbers"][matched_label] = row_idx + 1   # 1-based
+
+    return result
+
+
+def style_header(cell, bg="4472C4"):
+    cell.font      = Font(bold=True, color="FFFFFF")
+    cell.fill      = PatternFill("solid", fgColor=bg)
+    cell.alignment = Alignment(horizontal="center")
+
+
+def write_output(all_data: dict):
+    """
+    all_data = {
+        "Sheet1": { dates, data, row_numbers },
+        ...
+    }
+    """
+    wb_out = openpyxl.Workbook()
+
+    # ── Combined summary sheet ────────────────────────────────────────────────
+    ws_sum = wb_out.active
+    ws_sum.title = "Summary"
+
+    # Gather all unique dates across all sheets (preserving first-seen order)
+    seen_dates = []
+    for sheet_result in all_data.values():
+        for d in sheet_result.get("dates", []):
+            if d not in seen_dates:
+                seen_dates.append(d)
+
+    # Headers: Sheet | Metric | <date1> | <date2> | ...
+    headers = ["Sheet", "Metric"] + seen_dates
+    for col_idx, h in enumerate(headers, 1):
+        cell = ws_sum.cell(row=1, column=col_idx, value=h)
+        style_header(cell)
+
+    summary_row = 2
+    for sheet_name, result in all_data.items():
+        if not result.get("data"):
+            continue
+        for metric, values in result["data"].items():
+            ws_sum.cell(row=summary_row, column=1, value=sheet_name)
+            ws_sum.cell(row=summary_row, column=2, value=metric)
+            for col_idx, date in enumerate(seen_dates, 3):
+                ws_sum.cell(row=summary_row, column=col_idx, value=values.get(date))
+            summary_row += 1
+
+    # Auto-width for summary
+    for col_idx, h in enumerate(headers, 1):
+        ws_sum.column_dimensions[col_letter(col_idx)].width = max(len(str(h)) + 4, 14)
+
+    # ── One sheet per source sheet ────────────────────────────────────────────
+    for sheet_name, result in all_data.items():
+        if not result.get("data"):
+            continue
+
+        # Excel sheet names max 31 chars
+        safe_name = sheet_name[:31]
+        ws = wb_out.create_sheet(title=safe_name)
+
+        dates = result["dates"]
+        col_headers = ["Metric", "Source Row"] + dates
+        for col_idx, h in enumerate(col_headers, 1):
+            cell = ws.cell(row=1, column=col_idx, value=h)
+            style_header(cell, bg="70AD47")
+
+        for row_idx, (metric, values) in enumerate(result["data"].items(), 2):
+            ws.cell(row=row_idx, column=1, value=metric)
+            ws.cell(row=row_idx, column=2, value=result["row_numbers"].get(metric))
+            for col_idx, date in enumerate(dates, 3):
+                ws.cell(row=row_idx, column=col_idx, value=values.get(date))
+
+        for col_idx, h in enumerate(col_headers, 1):
+            ws.column_dimensions[col_letter(col_idx)].width = max(len(str(h)) + 4, 12)
+
+    wb_out.save(OUTPUT_FILE)
+    print(f"\n✅  Saved → {OUTPUT_FILE}")
+
+
+# ── MAIN ──────────────────────────────────────────────────────────────────────
+def main():
+    path = Path(INPUT_FILE)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Cannot find '{INPUT_FILE}'. "
+            "Place this script in the same folder as the Excel file, or update INPUT_FILE."
+        )
+
+    print(f"Opening: {path.resolve()}")
+    wb = load_workbook(path, read_only=True, data_only=True)
+    print(f"Sheets found: {wb.sheetnames}\n")
+
+    all_data = {}
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        print(f"Processing sheet: {sheet_name} …", end=" ")
+        result = extract_sheet(ws)
+        all_data[sheet_name] = result
+        if result.get("data"):
+            for metric, row_num in result["row_numbers"].items():
+                print(f"\n    ✔ Found '{metric}' at row {row_num} | "
+                      f"{len(result['data'][metric])} date columns")
+        else:
+            print("  (no Delinq rows found)")
+
+    write_output(all_data)
+
+    # ── Console preview ──────────────────────────────────────────────────────
+    print("\n─── EXTRACTED DATA PREVIEW ───")
+    for sheet_name, result in all_data.items():
+        if not result.get("data"):
+            continue
+        print(f"\nSheet: {sheet_name}")
+        dates = result["dates"]
+        print(f"  Columns (dates): {dates}")
+        for metric, values in result["data"].items():
+            row_vals = [f"{d}: {values.get(d)}" for d in dates]
+            print(f"  {metric}  →  {', '.join(row_vals)}")
+
+
+if __name__ == "__main__":
+    main()"""
+extract_delinq.py
+-----------------
+Extracts Delinq 30+ and Delinq 90+ values from EuropeanCStats.xlsx.
+
+Structure assumed (per sheet):
+  - Row 18        : column headers (col D onwards = date labels, e.g. "Feb 26", "Nov 25", ...)
+  - Column A      : metric labels (we scan for "Delinq 30+" and "Delinq 90+")
+  - Columns D+    : values for those metrics
+
+Output: extracted_delinq.xlsx  (one combined sheet + one sheet per source sheet)
+
+Requirements:
+    pip install openpyxl
+"""
+
+import re
+from pathlib import Path
+import openpyxl
+from openpyxl import load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
+
+# ── CONFIG ────────────────────────────────────────────────────────────────────
+INPUT_FILE  = "EuropeanCStats.xlsx"   # put this script next to the xlsx, or adjust path
+OUTPUT_FILE = "extracted_delinq.xlsx"
+HEADER_ROW  = 18          # row that contains date labels
+DATA_START_COL = 4        # column D = index 4 (1-based in openpyxl)
+TARGETS = ["delinq 30+", "delinq 90+"]   # lower-cased for matching
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def normalise(val) -> str:
+    """Return a stripped, lower-cased string for safe comparison."""
+    return str(val).strip().lower() if val is not None else ""
+
+
+def col_letter(idx_1based: int) -> str:
+    return get_column_letter(idx_1based)
+
+
+def extract_sheet(ws) -> dict:
+    """
+    Returns:
+        {
+          "dates":  ["Feb 26", "Nov 25", ...],          # from row 18, col D+
+          "data":   {
+              "Delinq 30+": {"Feb 26": 0.023, ...},
+              "Delinq 90+": {"Feb 26": 0.011, ...},
+          },
+          "row_numbers": {"Delinq 30+": 22, "Delinq 90+": 25}   # for reference
+        }
+    """
+    all_rows = list(ws.iter_rows(values_only=True))
+    total_rows = len(all_rows)
+
+    if total_rows < HEADER_ROW:
+        return {}
+
+    header_row_data = all_rows[HEADER_ROW - 1]   # 0-based index
+
+    # Collect date labels from col D (index 3) onwards, stopping at first None
+    dates = []
+    date_col_indices = []   # 0-based column indices
+    for col_idx in range(DATA_START_COL - 1, len(header_row_data)):
+        val = header_row_data[col_idx]
+        if val is not None:
+            dates.append(str(val).strip())
+            date_col_indices.append(col_idx)
+        # allow sparse headers: don't break on first None so we catch all columns
+
+    result = {"dates": dates, "data": {}, "row_numbers": {}}
+
+    for row_idx, row in enumerate(all_rows):
+        col_a = normalise(row[0])
+        matched_label = None
+        for target in TARGETS:
             if target in col_a:          # substring match so "Delinq 30+" inside longer text still hits
                 matched_label = str(row[0]).strip()
                 break
