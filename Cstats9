@@ -1,0 +1,598 @@
+"""
+extract_delinq.py
+-----------------
+Extracts Delinq 30+ and Delinq 90+ values from EuropeanCStats.xlsx.
+Uses CountryMapping.xlsx to group and sort deal columns by country
+in the pivot sheets.
+
+Structure assumed (per sheet):
+  - Row 18        : column headers (col D onwards = date labels)
+  - Column A      : metric labels (exact: "Delinq 30+" or "Delinq 90+" only)
+  - Columns D+    : values; "-" -> 0
+
+CountryMapping.xlsx:
+  - Column A : sheet name (may include "-Cstats" suffix)
+  - Column B : Country
+
+Outputs: extracted_delinq.xlsx
+  - Aggregated          : Sheet | Date | Delinq 30+ | Delinq 90+
+  - Summary             : Sheet | Metric | <date cols>
+  - Delinq 30+ by Deal  : dates as rows, deals grouped/sorted by country
+  - Delinq 90+ by Deal  : same for Delinq 90+
+  - one tab per source sheet
+
+Requirements:  pip install openpyxl
+"""
+
+from pathlib import Path
+from itertools import groupby
+import openpyxl
+from openpyxl import load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
+
+# ── CONFIG ─────────────────────────────────────────────────────────────────────
+INPUT_FILE      = "EuropeanCStats.xlsx"
+MAPPING_FILE    = "CountryMapping.xlsx"
+OUTPUT_FILE     = "extracted_delinq.xlsx"
+HEADER_ROW      = 18
+DATA_START_COL  = 4
+TARGETS         = {"Delinq 30+", "Delinq 90+"}
+UNKNOWN_COUNTRY = "Unknown"
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+# ── HELPERS ───────────────────────────────────────────────────────────────────
+def clean_value(val):
+    """'-' -> 0, None stays None, everything else unchanged."""
+    if val is None:
+        return None
+    if str(val).strip() == "-":
+        return 0
+    return val
+
+
+def col_letter(idx: int) -> str:
+    return get_column_letter(idx)
+
+
+MONTH_ORDER = {m: i for i, m in enumerate(
+    ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"], 1)}
+
+def parse_date_key(date_str: str):
+    """'Feb 26' -> (2026, 2) for chronological sorting."""
+    parts = date_str.replace("-", " ").split()
+    if len(parts) != 2:
+        return (9999, 99)
+    month = MONTH_ORDER.get(parts[0].lower()[:3], 99)
+    try:
+        yr = int(parts[1])
+        year = 2000 + yr if yr < 50 else 1900 + yr
+    except ValueError:
+        year = 9999
+    return (year, month)
+
+
+def style_cell(cell, bg="4472C4", bold=True, color="FFFFFF", wrap=False):
+    cell.font      = Font(bold=bold, color=color)
+    cell.fill      = PatternFill("solid", fgColor=bg)
+    cell.alignment = Alignment(horizontal="center", vertical="center",
+                               wrap_text=wrap)
+
+
+def auto_width(ws, col_count, start_col=1, min_width=14):
+    for i in range(start_col, start_col + col_count):
+        ws.column_dimensions[col_letter(i)].width = min_width
+
+
+# ── COUNTRY MAPPING ───────────────────────────────────────────────────────────
+def load_country_mapping(mapping_path: Path) -> dict:
+    """
+    Returns {sheet_name: country}.
+    Column A = sheet name (strips trailing '-Cstats' case-insensitively).
+    Column B = country.
+    """
+    mapping = {}
+    if not mapping_path.exists():
+        print(f"  [WARNING] {mapping_path} not found — no country grouping applied.")
+        return mapping
+
+    wb = load_workbook(mapping_path, read_only=True, data_only=True)
+    ws = wb.active
+    for row in ws.iter_rows(min_row=2, values_only=True):   # skip header row
+        if not row[0]:
+            continue
+        raw_name = str(row[0]).strip()
+        country  = str(row[1]).strip() if len(row) > 1 and row[1] else UNKNOWN_COUNTRY
+
+        # Strip "-Cstats" suffix so it matches the actual sheet name
+        normalised = raw_name
+        if normalised.lower().endswith("-cstats"):
+            normalised = normalised[:-7].strip()
+
+        mapping[normalised] = country
+    wb.close()
+    print(f"  Loaded {len(mapping)} entries from {mapping_path.name}")
+    return mapping
+
+
+def get_country(sheet_name: str, country_map: dict) -> str:
+    """Look up country; try exact match then strip '-Cstats'."""
+    if sheet_name in country_map:
+        return country_map[sheet_name]
+    stripped = sheet_name
+    if stripped.lower().endswith("-cstats"):
+        stripped = stripped[:-7].strip()
+    return country_map.get(stripped, UNKNOWN_COUNTRY)
+
+
+# ── EXTRACTION ────────────────────────────────────────────────────────────────
+def extract_sheet(ws) -> dict:
+    all_rows = list(ws.iter_rows(values_only=True))
+    if len(all_rows) < HEADER_ROW:
+        return {}
+
+    header_row_data  = all_rows[HEADER_ROW - 1]
+    dates            = []
+    date_col_indices = []
+    for col_idx in range(DATA_START_COL - 1, len(header_row_data)):
+        val = header_row_data[col_idx]
+        if val is not None:
+            dates.append(str(val).strip())
+            date_col_indices.append(col_idx)
+
+    result = {"dates": dates, "data": {}, "row_numbers": {}}
+
+    for row_idx, row in enumerate(all_rows):
+        raw_col_a = str(row[0]).strip() if row[0] is not None else ""
+        if raw_col_a not in TARGETS:
+            continue
+        if raw_col_a in result["data"]:
+            continue
+
+        row_values = {}
+        for date_label, col_idx in zip(dates, date_col_indices):
+            raw = row[col_idx] if col_idx < len(row) else None
+            row_values[date_label] = clean_value(raw)
+
+        result["data"][raw_col_a]        = row_values
+        result["row_numbers"][raw_col_a] = row_idx + 1
+
+    return result
+
+
+# ── PIVOT SHEET ───────────────────────────────────────────────────────────────
+# Colour palette for countries (cycles if more than 8 countries)
+COUNTRY_COLOURS = [
+    "4472C4", "70AD47", "ED7D31", "FFC000",
+    "5B9BD5", "A9D18E", "F4B183", "FFE699",
+]
+
+def write_pivot_sheet(wb_out, ws_title, metric, all_data,
+                      sorted_dates, header_bg, country_map):
+    ws = wb_out.create_sheet(ws_title)
+
+    # Deals that have this metric
+    deal_names = [s for s, r in all_data.items() if metric in r.get("data", {})]
+
+    # Sort deals: primary = country name, secondary = deal name
+    deal_names.sort(key=lambda s: (get_country(s, country_map), s))
+
+    # Group deals by country
+    country_groups = []   # [(country, [deal, deal, ...]), ...]
+    for country, group in groupby(deal_names,
+                                  key=lambda s: get_country(s, country_map)):
+        country_groups.append((country, list(group)))
+
+    # ── Row 1: "Date" + country labels (merged across their deals) ────────────
+    # ── Row 2: blank in col A + individual deal names ─────────────────────────
+    # ── Rows 3+: date values ──────────────────────────────────────────────────
+
+    # Freeze panes below row 2 and right of col A
+    ws.freeze_panes = "B3"
+
+    # Col A header: merge rows 1-2, label "Date"
+    ws.merge_cells(start_row=1, start_column=1, end_row=2, end_column=1)
+    style_cell(ws.cell(row=1, column=1, value="Date"), bg=header_bg)
+
+    col_cursor = 2  # next column to write
+    for c_idx, (country, deals) in enumerate(country_groups):
+        country_bg = COUNTRY_COLOURS[c_idx % len(COUNTRY_COLOURS)]
+        n = len(deals)
+
+        # Row 1: merged country label
+        if n > 1:
+            ws.merge_cells(start_row=1, start_column=col_cursor,
+                           end_row=1,   end_column=col_cursor + n - 1)
+        style_cell(ws.cell(row=1, column=col_cursor, value=country),
+                   bg=country_bg)
+
+        # Row 2: individual deal names
+        for deal in deals:
+            style_cell(ws.cell(row=2, column=col_cursor, value=deal),
+                       bg=country_bg, color="FFFFFF")
+            col_cursor += 1
+
+    # ── Reporting bounds per deal (for gap-fill logic) ────────────────────────
+    deal_reporting_bounds = {}
+    for sheet_name in deal_names:
+        deal_dates = all_data[sheet_name]["data"][metric]
+        reported   = [d for d in sorted_dates if d in deal_dates]
+        deal_reporting_bounds[sheet_name] = (
+            (reported[0], reported[-1]) if reported else (None, None)
+        )
+
+    last_known = {s: None for s in deal_names}
+
+    # ── Data rows (row 3 onwards) ─────────────────────────────────────────────
+    for row_idx, date in enumerate(sorted_dates, 3):
+        ws.cell(row=row_idx, column=1, value=date)
+
+        col_cursor = 2
+        for country, deals in country_groups:
+            for sheet_name in deals:
+                deal_dates           = all_data[sheet_name]["data"][metric]
+                first_date, last_date = deal_reporting_bounds[sheet_name]
+
+                if date in deal_dates:
+                    val = deal_dates[date]
+                    last_known[sheet_name] = val
+                elif (first_date is not None
+                      and parse_date_key(first_date)
+                          <= parse_date_key(date)
+                          <= parse_date_key(last_date)):
+                    val = last_known[sheet_name]   # gap-fill
+                else:
+                    val = None                      # before first / after last
+
+                ws.cell(row=row_idx, column=col_cursor, value=val)
+                col_cursor += 1
+
+    # ── Column widths ─────────────────────────────────────────────────────────
+    ws.column_dimensions["A"].width = 12
+    for i in range(2, 2 + len(deal_names)):
+        ws.column_dimensions[col_letter(i)].width = 16
+
+
+
+# ── STATS HELPERS ─────────────────────────────────────────────────────────────
+def numeric_values(values_dict: dict) -> list:
+    """Return only numeric (non-None) values from a date->value dict."""
+    return [v for v in values_dict.values()
+            if v is not None and isinstance(v, (int, float))]
+
+
+def safe_avg(vals):
+    return round(sum(vals) / len(vals), 6) if vals else None
+
+def safe_min(vals):
+    """Min excluding zeros — zeros represent missing data, not real lows."""
+    non_zero = [v for v in vals if v != 0]
+    return min(non_zero) if non_zero else None
+
+def safe_max(vals):
+    return max(vals) if vals else None
+
+def safe_percentile(vals, pct):
+    """Returns the pct-th percentile (0-100) using linear interpolation."""
+    if not vals:
+        return None
+    sorted_vals = sorted(vals)
+    n = len(sorted_vals)
+    if n == 1:
+        return sorted_vals[0]
+    idx = (pct / 100) * (n - 1)
+    lo, hi = int(idx), min(int(idx) + 1, n - 1)
+    frac = idx - lo
+    return round(sorted_vals[lo] + frac * (sorted_vals[hi] - sorted_vals[lo]), 6)
+
+
+def write_statistics_sheet(wb_out, all_data, country_map):
+    """
+    Statistics tab:
+    Country | Deal | D30 Avg | D30 Min | D30 Max | D90 Avg | D90 Min | D90 Max
+    Grouped and coloured by country. Stats from actual reported values only.
+    """
+    ws = wb_out.create_sheet("Statistics")
+
+    all_deals = [s for s, r in all_data.items() if r.get("data")]
+    all_deals.sort(key=lambda s: (get_country(s, country_map), s))
+
+    country_groups = []
+    for country, group in groupby(all_deals, key=lambda s: get_country(s, country_map)):
+        country_groups.append((country, list(group)))
+
+    headers = ["Country", "Deal",
+               "Delinq 30+ Avg", "Delinq 30+ Min", "Delinq 30+ P25",
+               "Delinq 30+ P75", "Delinq 30+ Max",
+               "Delinq 90+ Avg", "Delinq 90+ Min", "Delinq 90+ P25",
+               "Delinq 90+ P75", "Delinq 90+ Max"]
+    d30_cols = [3, 4, 5, 6, 7]
+    d90_cols = [8, 9, 10, 11, 12]
+    for col_idx, h in enumerate(headers, 1):
+        bg = "4472C4" if col_idx in d30_cols else ("C00000" if col_idx in d90_cols else "404040")
+        style_cell(ws.cell(row=1, column=col_idx, value=h), bg=bg)
+
+    data_row = 2
+    for c_idx, (country, deals) in enumerate(country_groups):
+        country_bg = COUNTRY_COLOURS[c_idx % len(COUNTRY_COLOURS)]
+        for deal in deals:
+            result = all_data[deal]
+            d30 = numeric_values(result["data"].get("Delinq 30+", {}))
+            d90 = numeric_values(result["data"].get("Delinq 90+", {}))
+
+            c = ws.cell(row=data_row, column=1, value=country)
+            c.fill = PatternFill("solid", fgColor=country_bg)
+            c.font = Font(bold=True, color="FFFFFF")
+            ws.cell(row=data_row, column=2,  value=deal)
+            ws.cell(row=data_row, column=3,  value=safe_avg(d30))
+            ws.cell(row=data_row, column=4,  value=safe_min(d30))
+            ws.cell(row=data_row, column=5,  value=safe_percentile(d30, 25))
+            ws.cell(row=data_row, column=6,  value=safe_percentile(d30, 75))
+            ws.cell(row=data_row, column=7,  value=safe_max(d30))
+            ws.cell(row=data_row, column=8,  value=safe_avg(d90))
+            ws.cell(row=data_row, column=9,  value=safe_min(d90))
+            ws.cell(row=data_row, column=10, value=safe_percentile(d90, 25))
+            ws.cell(row=data_row, column=11, value=safe_percentile(d90, 75))
+            ws.cell(row=data_row, column=12, value=safe_max(d90))
+            data_row += 1
+
+    for i, h in enumerate(headers, 1):
+        ws.column_dimensions[col_letter(i)].width = max(len(h) + 4, 16)
+
+
+def write_aggregated_stats_sheet(wb_out, all_data, country_map):
+    """
+    Aggregated Stats tab:
+    Country | Deals Count | Avg/Min/Max Delinq 30+ | Avg/Min/Max Delinq 90+
+    Values pooled from all deals in each country.
+    """
+    ws = wb_out.create_sheet("Aggregated Stats")
+
+    all_deals = [s for s, r in all_data.items() if r.get("data")]
+    all_deals.sort(key=lambda s: (get_country(s, country_map), s))
+
+    country_groups = []
+    for country, group in groupby(all_deals, key=lambda s: get_country(s, country_map)):
+        country_groups.append((country, list(group)))
+
+    headers = ["Country", "Deals Count",
+               "Country Avg Delinq 30+", "Country Min Delinq 30+",
+               "Country P25 Delinq 30+", "Country P75 Delinq 30+",
+               "Country Max Delinq 30+",
+               "Country Avg Delinq 90+", "Country Min Delinq 90+",
+               "Country P25 Delinq 90+", "Country P75 Delinq 90+",
+               "Country Max Delinq 90+"]
+    d30_cols = [3, 4, 5, 6, 7]
+    d90_cols = [8, 9, 10, 11, 12]
+    for col_idx, h in enumerate(headers, 1):
+        bg = "4472C4" if col_idx in d30_cols else ("C00000" if col_idx in d90_cols else "404040")
+        style_cell(ws.cell(row=1, column=col_idx, value=h), bg=bg)
+
+    data_row = 2
+    for c_idx, (country, deals) in enumerate(country_groups):
+        country_bg = COUNTRY_COLOURS[c_idx % len(COUNTRY_COLOURS)]
+        all_d30, all_d90 = [], []
+        for deal in deals:
+            result = all_data[deal]
+            all_d30.extend(numeric_values(result["data"].get("Delinq 30+", {})))
+            all_d90.extend(numeric_values(result["data"].get("Delinq 90+", {})))
+
+        c = ws.cell(row=data_row, column=1, value=country)
+        c.fill = PatternFill("solid", fgColor=country_bg)
+        c.font = Font(bold=True, color="FFFFFF")
+        ws.cell(row=data_row, column=2,  value=len(deals))
+        ws.cell(row=data_row, column=3,  value=safe_avg(all_d30))
+        ws.cell(row=data_row, column=4,  value=safe_min(all_d30))
+        ws.cell(row=data_row, column=5,  value=safe_percentile(all_d30, 25))
+        ws.cell(row=data_row, column=6,  value=safe_percentile(all_d30, 75))
+        ws.cell(row=data_row, column=7,  value=safe_max(all_d30))
+        ws.cell(row=data_row, column=8,  value=safe_avg(all_d90))
+        ws.cell(row=data_row, column=9,  value=safe_min(all_d90))
+        ws.cell(row=data_row, column=10, value=safe_percentile(all_d90, 25))
+        ws.cell(row=data_row, column=11, value=safe_percentile(all_d90, 75))
+        ws.cell(row=data_row, column=12, value=safe_max(all_d90))
+        data_row += 1
+
+    for i, h in enumerate(headers, 1):
+        ws.column_dimensions[col_letter(i)].width = max(len(h) + 4, 18)
+
+
+def write_country_index_sheet(wb_out, ws_title, metric, all_data, sorted_dates, country_map, bg):
+    """
+    Country Index tab:
+    - Column A : Date (oldest to newest, all dates across all deals)
+    - One column per country : average of all deals in that country
+                               that have an actual reported value on that date.
+                               Dates where NO deal in a country reported are left blank.
+    """
+    ws = wb_out.create_sheet(ws_title)
+
+    # Build sorted unique country list and their deals (that have this metric)
+    deal_names = [s for s, r in all_data.items() if metric in r.get("data", {})]
+    deal_names.sort(key=lambda s: (get_country(s, country_map), s))
+
+    countries_ordered = []
+    country_deals = {}
+    for sheet_name in deal_names:
+        country = get_country(sheet_name, country_map)
+        if country not in country_deals:
+            country_deals[country] = []
+            countries_ordered.append(country)
+        country_deals[country].append(sheet_name)
+
+    # Header row
+    headers = ["Date"] + countries_ordered
+    for col_idx, h in enumerate(headers, 1):
+        style_cell(ws.cell(row=1, column=col_idx, value=h), bg=bg)
+
+    # Data rows — one per date
+    for row_idx, date in enumerate(sorted_dates, 2):
+        ws.cell(row=row_idx, column=1, value=date)
+
+        for col_idx, country in enumerate(countries_ordered, 2):
+            # Only average actual reported values on this exact date (no gap-fill)
+            values_on_date = []
+            for deal in country_deals[country]:
+                deal_data = all_data[deal]["data"][metric]
+                if date in deal_data and deal_data[date] is not None:
+                    values_on_date.append(deal_data[date])
+
+            avg = safe_avg(values_on_date) if values_on_date else None
+            ws.cell(row=row_idx, column=col_idx, value=avg)
+
+    # Column widths
+    ws.column_dimensions["A"].width = 12
+    for i in range(2, 2 + len(countries_ordered)):
+        ws.column_dimensions[col_letter(i)].width = max(
+            len(countries_ordered[i - 2]) + 4, 18)
+
+    # Freeze date column
+    ws.freeze_panes = "B2"
+
+# ── OUTPUT ────────────────────────────────────────────────────────────────────
+def write_output(all_data: dict, country_map: dict):
+    wb_out = openpyxl.Workbook()
+
+    # ── 1. AGGREGATED ─────────────────────────────────────────────────────────
+    ws_agg = wb_out.active
+    ws_agg.title = "Aggregated"
+    agg_headers = ["Sheet", "Date", "Delinq 30+", "Delinq 90+"]
+    for col_idx, h in enumerate(agg_headers, 1):
+        style_cell(ws_agg.cell(row=1, column=col_idx, value=h))
+
+    agg_row = 2
+    for sheet_name, result in all_data.items():
+        if not result.get("data"):
+            continue
+        d30 = result["data"].get("Delinq 30+", {})
+        d90 = result["data"].get("Delinq 90+", {})
+        for date in result["dates"]:
+            ws_agg.cell(row=agg_row, column=1, value=sheet_name)
+            ws_agg.cell(row=agg_row, column=2, value=date)
+            ws_agg.cell(row=agg_row, column=3, value=d30.get(date))
+            ws_agg.cell(row=agg_row, column=4, value=d90.get(date))
+            agg_row += 1
+    auto_width(ws_agg, len(agg_headers))
+
+    # ── 2. SUMMARY (wide) ─────────────────────────────────────────────────────
+    ws_sum = wb_out.create_sheet("Summary")
+    seen_dates = []
+    for result in all_data.values():
+        for d in result.get("dates", []):
+            if d not in seen_dates:
+                seen_dates.append(d)
+
+    sum_headers = ["Sheet", "Metric"] + seen_dates
+    for col_idx, h in enumerate(sum_headers, 1):
+        style_cell(ws_sum.cell(row=1, column=col_idx, value=h), bg="70AD47")
+
+    sum_row = 2
+    for sheet_name, result in all_data.items():
+        if not result.get("data"):
+            continue
+        for metric, values in result["data"].items():
+            ws_sum.cell(row=sum_row, column=1, value=sheet_name)
+            ws_sum.cell(row=sum_row, column=2, value=metric)
+            for col_idx, date in enumerate(seen_dates, 3):
+                ws_sum.cell(row=sum_row, column=col_idx, value=values.get(date))
+            sum_row += 1
+    auto_width(ws_sum, len(sum_headers))
+
+    # ── 3. Per-source tabs ────────────────────────────────────────────────────
+    for sheet_name, result in all_data.items():
+        if not result.get("data"):
+            continue
+        ws = wb_out.create_sheet(title=sheet_name[:31])
+        dates       = result["dates"]
+        col_headers = ["Metric", "Source Row"] + dates
+        for col_idx, h in enumerate(col_headers, 1):
+            style_cell(ws.cell(row=1, column=col_idx, value=h), bg="ED7D31")
+        for row_idx, (metric, values) in enumerate(result["data"].items(), 2):
+            ws.cell(row=row_idx, column=1, value=metric)
+            ws.cell(row=row_idx, column=2, value=result["row_numbers"].get(metric))
+            for col_idx, date in enumerate(dates, 3):
+                ws.cell(row=row_idx, column=col_idx, value=values.get(date))
+        auto_width(ws, len(col_headers), min_width=12)
+
+    # ── 4. Sorted dates ───────────────────────────────────────────────────────
+    all_dates_set = set()
+    for result in all_data.values():
+        all_dates_set.update(result.get("dates", []))
+    sorted_dates = sorted(all_dates_set, key=parse_date_key)
+
+    # ── 5. Pivot: Delinq 30+ by Deal (grouped by country) ────────────────────
+    write_pivot_sheet(wb_out, "Delinq 30+ by Deal", "Delinq 30+",
+                      all_data, sorted_dates, "4472C4", country_map)
+
+    # ── 6. Pivot: Delinq 90+ by Deal (grouped by country) ────────────────────
+    write_pivot_sheet(wb_out, "Delinq 90+ by Deal", "Delinq 90+",
+                      all_data, sorted_dates, "C00000", country_map)
+
+    # ── 7. Statistics: Avg/Min/Max per deal, grouped by country ──────────────
+    write_statistics_sheet(wb_out, all_data, country_map)
+
+    # ── 8. Aggregated Stats: Avg/Min/Max pooled per country ───────────────────
+    write_aggregated_stats_sheet(wb_out, all_data, country_map)
+
+    # ── 9. Country Index: avg Delinq 30+ per country per date (plottable) ────
+    write_country_index_sheet(wb_out, "Country Index - Delinq 30+",
+                              "Delinq 30+", all_data, sorted_dates,
+                              country_map, bg="4472C4")
+
+    # ── 10. Country Index: avg Delinq 90+ per country per date (plottable) ───
+    write_country_index_sheet(wb_out, "Country Index - Delinq 90+",
+                              "Delinq 90+", all_data, sorted_dates,
+                              country_map, bg="C00000")
+
+    wb_out.save(OUTPUT_FILE)
+    print(f"\n✅  Saved -> {OUTPUT_FILE}")
+
+
+# ── MAIN ──────────────────────────────────────────────────────────────────────
+def main():
+    path = Path(INPUT_FILE)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Cannot find '{INPUT_FILE}'. "
+            "Place this script in the same folder as the Excel file."
+        )
+
+    print(f"Loading country mapping ...")
+    country_map = load_country_mapping(Path(MAPPING_FILE))
+
+    print(f"\nOpening: {path.resolve()}")
+    wb = load_workbook(path, read_only=True, data_only=True)
+    print(f"Sheets: {wb.sheetnames}\n")
+
+    all_data = {}
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        print(f"Processing: {sheet_name} ...", end=" ")
+        result = extract_sheet(ws)
+        all_data[sheet_name] = result
+        if result.get("data"):
+            for metric, row_num in result["row_numbers"].items():
+                print(f"\n    ✔ '{metric}' at row {row_num} | "
+                      f"{len(result['data'][metric])} date columns")
+        else:
+            print("  (no Delinq rows found)")
+
+    write_output(all_data, country_map)
+
+    # Console preview
+    print("\n--- AGGREGATED PREVIEW ---")
+    print(f"{'Sheet':<25} {'Date':<12} {'Delinq 30+':>12} {'Delinq 90+':>12}")
+    print("-" * 65)
+    for sheet_name, result in all_data.items():
+        if not result.get("data"):
+            continue
+        d30 = result["data"].get("Delinq 30+", {})
+        d90 = result["data"].get("Delinq 90+", {})
+        for date in result["dates"]:
+            print(f"{sheet_name:<25} {date:<12} "
+                  f"{str(d30.get(date, '')):>12} {str(d90.get(date, '')):>12}")
+
+
+if __name__ == "__main__":
+    main()
