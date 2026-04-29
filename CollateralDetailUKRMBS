@@ -208,18 +208,21 @@ def _set_col_widths(ws):
 
 
 # ─── MAIN ──────────────────────────────────────────────────────────────────────
-def main(input_path):
-    if not os.path.exists(input_path):
-        print(f"ERROR: File not found: {input_path}")
+INPUT_FILE  = "in.xlsx"
+OUTPUT_FILE = "out.xlsx"
+
+def main():
+    if not os.path.exists(INPUT_FILE):
+        print(f"ERROR: File not found: {INPUT_FILE}")
         sys.exit(1)
 
-    print(f"Reading: {input_path}")
-    wb_in = openpyxl.load_workbook(input_path, data_only=True)
+    print(f"Reading: {INPUT_FILE}")
+    wb_in = openpyxl.load_workbook(INPUT_FILE, data_only=True)
     sheet_names = wb_in.sheetnames
     print(f"Found {len(sheet_names)} sheet(s): {sheet_names}")
 
     wb_out = openpyxl.Workbook()
-    wb_out.remove(wb_out.active)   # remove default blank sheet
+    wb_out.remove(wb_out.active)
 
     all_dfs = []
 
@@ -235,7 +238,6 @@ def main(input_path):
 
         all_dfs.append(df)
 
-        # Per-deal sheet
         ws = wb_out.create_sheet(sheet_name[:31])
         row = 1
         for col_name in [c for c in TARGET_COLUMNS if c != "Current Balance"]:
@@ -243,21 +245,14 @@ def main(input_path):
             row = write_analysis_block(ws, row, col_name, analysis, sheet_name)
         _set_col_widths(ws)
 
-    # Combined sheet
     if all_dfs:
         combined = pd.concat(all_dfs, ignore_index=True)
         write_combined_sheet(wb_out, combined)
-        # Move combined to first position
         wb_out.move_sheet("Combined – All Deals", offset=-len(wb_out.sheetnames) + 1)
 
-    output_path = os.path.splitext(input_path)[0] + "_SUMMARY.xlsx"
-    wb_out.save(output_path)
-    print(f"\nDone! Summary saved to: {output_path}")
-    return output_path
+    wb_out.save(OUTPUT_FILE)
+    print(f"\nDone! Summary saved to: {OUTPUT_FILE}")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python analyze_deals.py <path_to_xlsx>")
-        sys.exit(1)
-    main(sys.argv[1])
+    main()
