@@ -1,0 +1,351 @@
+import pandas as pd
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+import sys
+import os
+from collections import defaultdict
+
+# ─── CONFIG ────────────────────────────────────────────────────────────────────
+# Each entry is:  ("Canonical Label", ["possible col name 1", "possible col name 2", ...])
+# The script scans the header row and uses the FIRST alias it finds.
+# A warning is printed if NONE of the aliases are found in a sheet.
+# "Current Balance" must always be present — it is the balance denominator.
+#
+TARGET_COLUMNS = [
+    ("Occupancy", [
+        "Occupancy",
+        "Occupancy (Passthrough)",
+        "Occ",
+    ]),
+    ("Lien Info", [
+        "Lien Info",
+        "Lien Information",
+        "Lien Position",
+    ]),
+    ("Income Verification for Primary Income", [
+        "Income Verification for Primary Income",
+        "Income Verification",
+        "Income Doc Type",
+        "Doc Type",
+    ]),
+    # ("Property Type", ["Property Type", "Prop Type"]),   # uncomment to include
+    # ("Loan Purpose",  ["Loan Purpose",  "Purpose"]),     # uncomment to include
+    # ("State",         ["State", "Property State"]),      # uncomment to include
+    ("Current Balance", [                                  # ← keep this always
+        "Current Balance",
+        "Curr Balance",
+        "Balance",
+    ]),
+]
+
+# Derive flat lists used elsewhere
+CANONICAL_NAMES   = [c[0] for c in TARGET_COLUMNS]
+BALANCE_CANONICAL = "Current Balance"
+
+HEADER_ROW = 11       # row with column names
+DATA_START_ROW = 17   # first data row (skip 12-16)
+
+# ─── CATEGORY NORMALIZATION ────────────────────────────────────────────────────
+# For each target column, define (keyword_fragment, canonical_label) pairs.
+# Matching is case-insensitive. First match wins.
+# Values that match nothing are kept exactly as-is (no silent data loss).
+#
+CATEGORY_MAPPINGS = {
+    "Occupancy": [
+        # keyword fragment          canonical label shown in output
+        ("non-owner",               "Non-Owner Occupied"),
+        ("non owner",               "Non-Owner Occupied"),
+        ("owner",                   "Owner Occupied"),       # must come AFTER "non-owner"
+        ("investment",              "Investment"),
+        ("second home",             "Second Home"),
+        ("2nd home",                "Second Home"),
+        ("unknown",                 "Unknown"),
+        # e.g. "Occupancy (passthrough)" → no match → kept as "Occupancy (passthrough)"
+    ],
+    "Lien Info": [
+        ("1st",                     "1st Lien"),
+        ("first",                   "1st Lien"),
+        ("2nd",                     "2nd Lien"),
+        ("second",                  "2nd Lien"),
+        ("3rd",                     "3rd Lien"),
+        ("third",                   "3rd Lien"),
+    ],
+    "Income Verification for Primary Income": [
+        ("full doc",                "Full Doc"),
+        ("full",                    "Full Doc"),
+        ("bank statement",          "Bank Statement"),
+        ("stated",                  "Stated"),
+        ("no doc",                  "No Doc"),
+        ("nodoc",                   "No Doc"),
+        ("asset depletion",         "Asset Depletion"),
+        ("asset",                   "Asset Depletion"),
+        ("dscr",                    "DSCR"),
+        ("unknown",                 "Unknown"),
+    ],
+    # Add more columns here following the same pattern
+}
+
+
+# ─── HELPERS ───────────────────────────────────────────────────────────────────
+def find_columns(header_row_values, sheet_name=""):
+    """Return {canonical_name: col_index} by checking each alias list in order."""
+    mapping = {}
+    for canonical, aliases in TARGET_COLUMNS:
+        for alias in aliases:
+            for idx, cell in enumerate(header_row_values):
+                if cell is None:
+                    continue
+                cell_str = str(cell).strip()
+                if alias.lower() == cell_str.lower():          # exact match first
+                    mapping[canonical] = idx
+                    break
+            if canonical in mapping:
+                break
+        # fallback: substring match if exact failed
+        if canonical not in mapping:
+            for alias in aliases:
+                for idx, cell in enumerate(header_row_values):
+                    if cell is None:
+                        continue
+                    cell_str = str(cell).strip()
+                    if alias.lower() in cell_str.lower() or cell_str.lower() in alias.lower():
+                        mapping[canonical] = idx
+                        break
+                if canonical in mapping:
+                    break
+        if canonical not in mapping:
+            print(f"  [WARN] '{sheet_name}': none of the aliases for '{canonical}' found → {aliases}")
+    return mapping
+
+
+def safe_float(val):
+    try:
+        if val is None or str(val).strip() in ("", "N/A", "n/a", "-"):
+            return None
+        return float(str(val).replace(",", "").replace("$", "").strip())
+    except (ValueError, TypeError):
+        return None
+
+
+def categorize_value(val, col_name=None):
+    if val is None or str(val).strip() in ("", "N/A", "n/a", "-", "nan"):
+        return "Missing / Blank"
+    raw = str(val).strip()
+    if col_name and col_name in CATEGORY_MAPPINGS:
+        raw_lower = raw.lower()
+        for fragment, canonical in CATEGORY_MAPPINGS[col_name]:
+            if fragment.lower() in raw_lower:
+                return canonical
+    return raw
+
+
+# ─── READ DATA ─────────────────────────────────────────────────────────────────
+def read_deal_sheet(wb, sheet_name):
+    ws = wb[sheet_name]
+    rows = list(ws.iter_rows(values_only=True))
+
+    if len(rows) < HEADER_ROW:
+        return None, {}
+
+    header_row_values = rows[HEADER_ROW - 1]   # 0-indexed
+    col_map = find_columns(header_row_values)
+
+    if BALANCE_CANONICAL not in col_map:
+        print(f"  [WARN] '{sheet_name}': 'Current Balance' (or alias) not found – skipping.")
+        return None, col_map
+
+    data_rows = rows[DATA_START_ROW - 1:]       # skip rows 12-16
+
+    records = []
+    for row in data_rows:
+        if all(v is None for v in row):
+            continue
+        record = {}
+        for col_name, col_idx in col_map.items():
+            if col_idx < len(row):
+                record[col_name] = row[col_idx]
+            else:
+                record[col_name] = None
+        records.append(record)
+
+    return pd.DataFrame(records) if records else None, col_map
+
+
+# ─── ANALYZE ONE CATEGORY ──────────────────────────────────────────────────────
+def analyze_column(df, col_name):
+    """Return DataFrame with Count, Balance, % of Total Balance per category."""
+    if col_name not in df.columns or BALANCE_CANONICAL not in df.columns:
+        return pd.DataFrame()
+
+    df2 = df[[col_name, BALANCE_CANONICAL]].copy()
+    df2[col_name] = df2[col_name].apply(lambda v: categorize_value(v, col_name))
+    df2["_bal"] = df2[BALANCE_CANONICAL].apply(safe_float).fillna(0)
+
+    grouped = (
+        df2.groupby(col_name)
+        .agg(Count=(col_name, "count"), Balance=("_bal", "sum"))
+        .reset_index()
+        .rename(columns={col_name: "Category"})
+    )
+    total_balance = grouped["Balance"].sum()
+    grouped["% of Balance"] = grouped["Balance"] / total_balance if total_balance else 0
+    grouped["% of Count"] = grouped["Count"] / grouped["Count"].sum()
+    return grouped.sort_values("Balance", ascending=False).reset_index(drop=True)
+
+
+# ─── WRITE SUMMARY EXCEL ───────────────────────────────────────────────────────
+HEADER_FILL  = PatternFill("solid", start_color="1F4E79")   # dark blue
+SUBHDR_FILL  = PatternFill("solid", start_color="2E75B6")   # mid blue
+ALT_FILL     = PatternFill("solid", start_color="D6E4F0")   # light blue
+TOTAL_FILL   = PatternFill("solid", start_color="BDD7EE")
+
+WHITE_FONT   = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+BOLD_FONT    = Font(name="Arial", bold=True, size=10)
+NORMAL_FONT  = Font(name="Arial", size=10)
+TOTAL_FONT   = Font(name="Arial", bold=True, size=10)
+
+CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
+LEFT   = Alignment(horizontal="left",   vertical="center", wrap_text=True)
+
+def thin_border():
+    s = Side(style="thin", color="A0A0A0")
+    return Border(left=s, right=s, top=s, bottom=s)
+
+def write_analysis_block(ws, start_row, title, analysis_df, deal_name):
+    """Write one category block and return next available row."""
+    # Section title
+    ws.merge_cells(start_row=start_row, start_column=1, end_row=start_row, end_column=6)
+    cell = ws.cell(row=start_row, column=1, value=f"  {deal_name}  –  {title}")
+    cell.font = WHITE_FONT
+    cell.fill = HEADER_FILL
+    cell.alignment = LEFT
+    ws.row_dimensions[start_row].height = 20
+    start_row += 1
+
+    # Column headers
+    headers = ["Category", "Count", "% of Count", "Balance ($)", "% of Balance", ""]
+    for c, h in enumerate(headers, 1):
+        cell = ws.cell(row=start_row, column=c, value=h)
+        cell.font = WHITE_FONT
+        cell.fill = SUBHDR_FILL
+        cell.alignment = CENTER
+        cell.border = thin_border()
+    ws.row_dimensions[start_row].height = 18
+    start_row += 1
+
+    if analysis_df.empty:
+        ws.cell(row=start_row, column=1, value="No data available").font = NORMAL_FONT
+        return start_row + 2
+
+    total_count   = analysis_df["Count"].sum()
+    total_balance = analysis_df["Balance"].sum()
+
+    for i, row in analysis_df.iterrows():
+        fill = ALT_FILL if i % 2 == 0 else PatternFill("solid", start_color="FFFFFF")
+        vals = [
+            row["Category"],
+            row["Count"],
+            row["% of Count"],
+            row["Balance"],
+            row["% of Balance"],
+            "",
+        ]
+        for c, v in enumerate(vals, 1):
+            cell = ws.cell(row=start_row, column=c, value=v)
+            cell.font  = NORMAL_FONT
+            cell.fill  = fill
+            cell.border = thin_border()
+            if c == 1:
+                cell.alignment = LEFT
+            else:
+                cell.alignment = CENTER
+            if c == 3 or c == 5:
+                cell.number_format = "0.0%"
+            if c == 4:
+                cell.number_format = '#,##0.00'
+        start_row += 1
+
+    # Totals row
+    vals = ["TOTAL", total_count, 1.0, total_balance, 1.0, ""]
+    for c, v in enumerate(vals, 1):
+        cell = ws.cell(row=start_row, column=c, value=v)
+        cell.font  = TOTAL_FONT
+        cell.fill  = TOTAL_FILL
+        cell.border = thin_border()
+        if c == 1:
+            cell.alignment = LEFT
+        else:
+            cell.alignment = CENTER
+        if c == 3 or c == 5:
+            cell.number_format = "0.0%"
+        if c == 4:
+            cell.number_format = '#,##0.00'
+    start_row += 2
+    return start_row
+
+
+def write_combined_sheet(wb_out, combined_df):
+    """Write a roll-up sheet across ALL deals."""
+    ws = wb_out.create_sheet("Combined – All Deals")
+    row = 1
+    for col_name in [c for c in CANONICAL_NAMES if c != BALANCE_CANONICAL]:
+        row = write_analysis_block(ws, row, col_name, analyze_column(combined_df, col_name), "ALL DEALS")
+    _set_col_widths(ws)
+
+
+def _set_col_widths(ws):
+    widths = [45, 10, 13, 18, 15, 4]
+    for i, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+
+# ─── MAIN ──────────────────────────────────────────────────────────────────────
+INPUT_FILE  = "in.xlsx"
+OUTPUT_FILE = "out.xlsx"
+
+def main():
+    if not os.path.exists(INPUT_FILE):
+        print(f"ERROR: File not found: {INPUT_FILE}")
+        sys.exit(1)
+
+    print(f"Reading: {INPUT_FILE}")
+    wb_in = openpyxl.load_workbook(INPUT_FILE, data_only=True)
+    sheet_names = wb_in.sheetnames
+    print(f"Found {len(sheet_names)} sheet(s): {sheet_names}")
+
+    wb_out = openpyxl.Workbook()
+    wb_out.remove(wb_out.active)
+
+    all_dfs = []
+
+    for sheet_name in sheet_names:
+        print(f"Processing: {sheet_name}")
+        df, col_map = read_deal_sheet(wb_in, sheet_name)
+        if df is None or df.empty:
+            print(f"  [SKIP] No usable data in '{sheet_name}'.")
+            continue
+
+        print(f"  Columns found: {list(col_map.keys())}")
+        print(f"  Rows: {len(df)}")
+
+        all_dfs.append(df)
+
+        ws = wb_out.create_sheet(sheet_name[:31])
+        row = 1
+        for col_name in [c for c in CANONICAL_NAMES if c != BALANCE_CANONICAL]:
+            analysis = analyze_column(df, col_name)
+            row = write_analysis_block(ws, row, col_name, analysis, sheet_name)
+        _set_col_widths(ws)
+
+    if all_dfs:
+        combined = pd.concat(all_dfs, ignore_index=True)
+        write_combined_sheet(wb_out, combined)
+        wb_out.move_sheet("Combined – All Deals", offset=-len(wb_out.sheetnames) + 1)
+
+    wb_out.save(OUTPUT_FILE)
+    print(f"\nDone! Summary saved to: {OUTPUT_FILE}")
+
+
+if __name__ == "__main__":
+    main()
