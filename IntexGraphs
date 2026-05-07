@@ -3,196 +3,285 @@
 Deal Performance Dashboard Generator
 Reads an Excel file with deal performance data and generates an interactive HTML dashboard.
 
-Usage:
-    python generate_dashboard.py --input your_file.xlsx --output dashboard.html
-
-Required columns (per worksheet):
-    Deal, date, collat_bal, 1mo_dlq90_reported, 3mo_cpr_reported, 3mo_cdr_reported
+Set INPUT_FILE and OUTPUT_FILE below, then run all cells.
 """
 
-import argparse
+# ─── Configuration ────────────────────────────────────────────────────────────
+INPUT_FILE  = "your_file.xlsx"      # <- path to your Excel file
+OUTPUT_FILE = "dashboard.html"      # <- where to save the HTML dashboard
+# ──────────────────────────────────────────────────────────────────────────────
+
 import sys
 import json
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import plotly.io as pio
 from pathlib import Path
 
 
+# ─── Column alias table ───────────────────────────────────────────────────────
+# KEY         -> internal name used everywhere in the script
+# VALUE LIST  -> all acceptable raw column names (case-insensitive, order = priority)
+
+COLUMN_ALIASES: dict = {
+    # -- identifiers ----------------------------------------------------------
+    "deal":       ["Deal", "deal", "deal_name", "DealName"],
+    "date":       ["date", "Date", "report_date", "period", "Period"],
+
+    # -- balance --------------------------------------------------------------
+    "collat_bal": ["collat_bal", "collateral_balance", "coll_bal",
+                   "collateral_bal", "bal", "balance"],
+
+    # -- DLQ 90+ --------------------------------------------------------------
+    "dlq90":      ["1mo_dlq90_reported", "1m_dlq90_reported",
+                   "1mo_dq90_reported",  "1m_dq90_reported",
+                   "dlq90_reported",     "dq90_reported",
+                   "dlq90",              "dq90"],
+
+    # -- CPR ------------------------------------------------------------------
+    "cpr":        ["3mo_cpr_reported", "3m_cpr_reported",
+                   "cpr_reported",     "cpr"],
+
+    # -- CDR ------------------------------------------------------------------
+    "cdr":        ["3mo_cdr_reported", "3m_cdr_reported",
+                   "cdr_reported",     "cdr"],
+}
+
+# Internal column order used after alias resolution
+CANONICAL_COLS = ["deal", "date", "collat_bal", "dlq90", "cpr", "cdr"]
+
+
 # ─── Colour palette ──────────────────────────────────────────────────────────
 PALETTE = {
-    "bg":           "#0b0f1a",
-    "surface":      "#111827",
-    "surface2":     "#1a2235",
-    "border":       "#1f2d45",
-    "accent1":      "#38bdf8",   # sky   – DLQ90
-    "accent2":      "#34d399",   # emerald – CPR
-    "accent3":      "#f87171",   # red   – CDR
-    "accent4":      "#a78bfa",   # violet – Collat Bal
-    "text":         "#e2e8f0",
-    "text_dim":     "#64748b",
-    "grid":         "#1e2d3d",
+    "bg":       "#0b0f1a",
+    "surface":  "#111827",
+    "surface2": "#1a2235",
+    "border":   "#1f2d45",
+    "accent1":  "#38bdf8",   # sky     - DLQ90
+    "accent2":  "#34d399",   # emerald - CPR
+    "accent3":  "#f87171",   # red     - CDR
+    "accent4":  "#a78bfa",   # violet  - Collat Bal
+    "text":     "#e2e8f0",
+    "text_dim": "#64748b",
+    "grid":     "#1e2d3d",
 }
 
 CHART_DEFS = [
-    {
-        "col":    "1mo_dlq90_reported",
-        "label":  "DLQ 90+",
-        "unit":   "%",
-        "color":  PALETTE["accent1"],
-        "fill":   "rgba(56,189,248,0.08)",
-        "icon":   "⚠",
-        "fmt":    ".2f",
-    },
-    {
-        "col":    "3mo_cpr_reported",
-        "label":  "3-Mo CPR",
-        "unit":   "%",
-        "color":  PALETTE["accent2"],
-        "fill":   "rgba(52,211,153,0.08)",
-        "icon":   "⟳",
-        "fmt":    ".2f",
-    },
-    {
-        "col":    "3mo_cdr_reported",
-        "label":  "3-Mo CDR",
-        "unit":   "%",
-        "color":  PALETTE["accent3"],
-        "fill":   "rgba(248,113,113,0.08)",
-        "icon":   "↓",
-        "fmt":    ".2f",
-    },
-    {
-        "col":    "collat_bal",
-        "label":  "Collateral Balance",
-        "unit":   "",
-        "color":  PALETTE["accent4"],
-        "fill":   "rgba(167,139,250,0.08)",
-        "icon":   "$",
-        "fmt":    ",.0f",
-    },
+    {"col": "dlq90",      "label": "DLQ 90+",           "unit": "%", "color": PALETTE["accent1"], "fill": "rgba(56,189,248,0.08)",  "icon": "!",  "fmt": ".2f"},
+    {"col": "cpr",        "label": "3-Mo CPR",           "unit": "%", "color": PALETTE["accent2"], "fill": "rgba(52,211,153,0.08)",  "icon": "~",  "fmt": ".2f"},
+    {"col": "cdr",        "label": "3-Mo CDR",           "unit": "%", "color": PALETTE["accent3"], "fill": "rgba(248,113,113,0.08)", "icon": "v",  "fmt": ".2f"},
+    {"col": "collat_bal", "label": "Collateral Balance", "unit": "",  "color": PALETTE["accent4"], "fill": "rgba(167,139,250,0.08)", "icon": "$",  "fmt": ",.0f"},
 ]
 
-REQUIRED_COLS = {"Deal", "date",
-                 "collat_bal", "1mo_dlq90_reported",
-                 "3mo_cpr_reported", "3mo_cdr_reported"}
+
+# ─── Column resolution ────────────────────────────────────────────────────────
+
+def resolve_columns(raw_cols):
+    """
+    Given the raw column names of a sheet, return:
+      (mapping_dict, missing_list)
+    where mapping_dict = { canonical_key: raw_column_name }.
+    Matching is case-insensitive and strips surrounding whitespace.
+    """
+    normed = {c.strip().lower(): c for c in raw_cols}
+    mapping = {}
+    missing = []
+
+    for key, aliases in COLUMN_ALIASES.items():
+        found = None
+        for alias in aliases:
+            if alias.strip().lower() in normed:
+                found = normed[alias.strip().lower()]
+                break
+        if found:
+            mapping[key] = found
+        else:
+            missing.append(key)
+
+    return mapping, missing
+
+
+# ─── Frequency detection ──────────────────────────────────────────────────────
+
+def detect_frequency(dates, values):
+    """
+    Return 'quarterly', 'monthly', or 'unknown' by inspecting the median gap
+    between consecutive non-null observations.
+
+      quarterly -> median gap > 60 days  (every ~3 months)
+      monthly   -> median gap <= 60 days
+    """
+    valid_dates = dates[values.notna()].sort_values().reset_index(drop=True)
+    if len(valid_dates) < 3:
+        return "unknown"
+    diffs = valid_dates.diff().dropna().dt.days
+    return "quarterly" if diffs.median() > 60 else "monthly"
 
 
 # ─── Data loading ─────────────────────────────────────────────────────────────
 
-def load_excel(path: str) -> pd.DataFrame:
-    """Load all worksheets, stack them, and return a clean DataFrame."""
+def load_excel(path):
+    """Load all worksheets, resolve columns via alias table, stack and return clean DataFrame."""
     xl = pd.ExcelFile(path)
     frames = []
+
     for sheet in xl.sheet_names:
-        df = xl.parse(sheet)
-        # Normalise column names: strip whitespace, lower-case for matching
-        df.columns = df.columns.str.strip()
-        # Case-insensitive rename to canonical names
-        col_map = {c: c for c in df.columns}
-        for canon in list(REQUIRED_COLS):
-            for raw in df.columns:
-                if raw.lower() == canon.lower() and raw != canon:
-                    col_map[raw] = canon
-        df = df.rename(columns=col_map)
-        missing = REQUIRED_COLS - set(df.columns)
+        raw = xl.parse(sheet)
+        raw.columns = raw.columns.astype(str)
+
+        col_map, missing = resolve_columns(list(raw.columns))
+
         if missing:
-            print(f"  [skip] Sheet '{sheet}' missing columns: {missing}")
+            print(f"  [skip] Sheet '{sheet}' - could not resolve: {missing}")
             continue
+
+        # Rename matched raw columns to canonical keys
+        rename = {v: k for k, v in col_map.items()}
+        df = raw.rename(columns=rename)[CANONICAL_COLS].copy()
         df["_sheet"] = sheet
-        frames.append(df[list(REQUIRED_COLS) + ["_sheet"]])
+        frames.append(df)
+        print(f"  [ok]   Sheet '{sheet}' resolved: "
+              f"dlq90<-'{col_map['dlq90']}', "
+              f"cpr<-'{col_map['cpr']}', "
+              f"cdr<-'{col_map['cdr']}'")
 
     if not frames:
-        sys.exit("ERROR: No usable worksheets found. Check column names.")
+        sys.exit(
+            "ERROR: No usable worksheets found.\n"
+            "Check the COLUMN_ALIASES table at the top of this script."
+        )
 
     out = pd.concat(frames, ignore_index=True)
     out["date"] = pd.to_datetime(out["date"], errors="coerce")
-    out = out.dropna(subset=["date", "Deal"])
-    out["Deal"] = out["Deal"].astype(str).str.strip()
-    for c in ["collat_bal", "1mo_dlq90_reported", "3mo_cpr_reported", "3mo_cdr_reported"]:
+    out["deal"] = out["deal"].astype(str).str.strip()
+    out = out.dropna(subset=["date", "deal"])
+
+    for c in ["collat_bal", "dlq90", "cpr", "cdr"]:
         out[c] = pd.to_numeric(out[c], errors="coerce")
-    out = out.sort_values(["Deal", "date"])
-    return out
+
+    return out.sort_values(["deal", "date"]).reset_index(drop=True)
 
 
-# ─── Plotly figure builder ────────────────────────────────────────────────────
+# ─── Trace builders ───────────────────────────────────────────────────────────
 
-def build_figure(df_deal: pd.DataFrame, deal_name: str) -> go.Figure:
-    """Build a 2×2 subplot figure for one deal."""
+def _monthly_traces(dates, series, cd):
+    """Smooth filled area traces for dense / monthly series."""
+    traces = [
+        go.Scatter(
+            x=dates, y=series,
+            mode="lines",
+            name=cd["label"],
+            line=dict(color=cd["color"], width=2.5, shape="spline", smoothing=0.4),
+            fill="tozeroy",
+            fillcolor=cd["fill"],
+            connectgaps=False,
+            hovertemplate=(
+                f"<b>%{{x|%b %Y}}</b><br>{cd['label']}: "
+                f"%{{y:{cd['fmt']}}}{cd['unit']}<extra></extra>"
+            ),
+        )
+    ]
+    valid = series.dropna()
+    if not valid.empty:
+        last_idx = valid.index[-1]
+        traces.append(go.Scatter(
+            x=[dates.loc[last_idx]], y=[valid.iloc[-1]],
+            mode="markers",
+            marker=dict(color=cd["color"], size=9,
+                        line=dict(color="#0b0f1a", width=2)),
+            showlegend=False, hoverinfo="skip",
+        ))
+    return traces
+
+
+def _quarterly_traces(dates, series, cd):
+    """
+    Bar chart for quarterly / sparse series.
+    Only plots rows where a value is actually reported -
+    no NaN gaps, no misleading interpolation between periods.
+    """
+    mask   = series.notna()
+    x_vals = dates[mask]
+    y_vals = series[mask]
+
+    return [
+        go.Bar(
+            x=x_vals, y=y_vals,
+            name=cd["label"],
+            marker_color=cd["color"],
+            marker_opacity=0.75,
+            marker_line=dict(color=cd["color"], width=1),
+            hovertemplate=(
+                f"<b>%{{x|%b %Y}}</b><br>{cd['label']}: "
+                f"%{{y:{cd['fmt']}}}{cd['unit']}<extra></extra>"
+            ),
+        )
+    ]
+
+
+# ─── Figure builder ───────────────────────────────────────────────────────────
+
+def build_figure(df_deal, deal_name):
+    """Build 2x2 subplot figure, auto-detecting quarterly vs monthly per metric."""
+    positions = [(1, 1), (1, 2), (2, 1), (2, 2)]
+
+    # Pre-detect frequencies to build subplot titles
+    frequencies = {}
+    subplot_titles = []
+    for cd in CHART_DEFS:
+        freq = detect_frequency(df_deal["date"], df_deal[cd["col"]])
+        frequencies[cd["col"]] = freq
+        title = cd["label"] + (" [Q]" if freq == "quarterly" else "")
+        subplot_titles.append(title)
+
     fig = make_subplots(
         rows=2, cols=2,
-        subplot_titles=[c["label"] for c in CHART_DEFS],
-        vertical_spacing=0.14,
+        subplot_titles=subplot_titles,
+        vertical_spacing=0.15,
         horizontal_spacing=0.10,
     )
-    positions = [(1, 1), (1, 2), (2, 1), (2, 2)]
 
     for cd, (row, col) in zip(CHART_DEFS, positions):
         series = df_deal[cd["col"]].copy()
-        dates  = df_deal["date"]
+        dates  = df_deal["date"].copy()
+        freq   = frequencies[cd["col"]]
 
-        # Latest value for annotation
-        latest = series.dropna().iloc[-1] if not series.dropna().empty else None
+        traces = (_quarterly_traces if freq == "quarterly"
+                  else _monthly_traces)(dates, series, cd)
 
-        # Area trace
-        fig.add_trace(
-            go.Scatter(
-                x=dates, y=series,
-                mode="lines",
-                name=cd["label"],
-                line=dict(color=cd["color"], width=2.5, shape="spline", smoothing=0.4),
-                fill="tozeroy",
-                fillcolor=cd["fill"],
-                hovertemplate=f"<b>%{{x|%b %Y}}</b><br>{cd['label']}: %{{y:{cd['fmt']}}}{cd['unit']}<extra></extra>",
-            ),
-            row=row, col=col,
-        )
+        for tr in traces:
+            fig.add_trace(tr, row=row, col=col)
 
-        # Dot for latest value
-        if latest is not None:
-            fig.add_trace(
-                go.Scatter(
-                    x=[dates.iloc[-1]], y=[latest],
-                    mode="markers",
-                    marker=dict(color=cd["color"], size=9, line=dict(color="#0b0f1a", width=2)),
-                    showlegend=False,
-                    hoverinfo="skip",
-                ),
-                row=row, col=col,
-            )
-
-        # Axis formatting
-        axis_kwargs = dict(
+        axis_base = dict(
             showgrid=True, gridcolor=PALETTE["grid"], gridwidth=1,
             zeroline=False,
-            tickfont=dict(color=PALETTE["text_dim"], size=10, family="'DM Mono', monospace"),
+            tickfont=dict(color=PALETTE["text_dim"], size=10,
+                          family="'DM Mono', monospace"),
             linecolor=PALETTE["border"],
         )
-        y_suffix = cd["unit"] if cd["unit"] in ("%",) else ""
+        y_suffix = cd["unit"] if cd["unit"] == "%" else ""
         y_fmt    = ".1f" if cd["unit"] == "%" else ",.3s"
 
-        fig.update_xaxes(
-            **axis_kwargs,
-            tickformat="%b %Y",
-            row=row, col=col,
-        )
-        fig.update_yaxes(
-            **axis_kwargs,
-            ticksuffix=y_suffix,
-            tickformat=y_fmt,
-            row=row, col=col,
-        )
+        fig.update_xaxes(**axis_base, tickformat="%b %Y", row=row, col=col)
+        fig.update_yaxes(**axis_base, ticksuffix=y_suffix,
+                         tickformat=y_fmt, row=row, col=col)
 
-    # Subplot title colour
+    # Colour [Q] titles differently to make it obvious
     for ann in fig.layout.annotations:
-        ann.update(font=dict(color=PALETTE["text"], size=13, family="'Syne', sans-serif"),
-                   x=ann.x, y=ann.y)
+        is_q = "[Q]" in (ann.text or "")
+        ann.update(font=dict(
+            color=PALETTE["accent3"] if is_q else PALETTE["text"],
+            size=12,
+            family="'Syne', sans-serif",
+        ))
 
     fig.update_layout(
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         showlegend=False,
+        barmode="overlay",
         margin=dict(l=40, r=20, t=55, b=30),
         font=dict(family="'DM Mono', monospace", color=PALETTE["text"]),
         hoverlabel=dict(
@@ -204,27 +293,21 @@ def build_figure(df_deal: pd.DataFrame, deal_name: str) -> go.Figure:
     return fig
 
 
-# ─── Per-deal stats helper ────────────────────────────────────────────────────
+# ─── Stats helper ─────────────────────────────────────────────────────────────
 
-def stats_for_deal(df_deal: pd.DataFrame) -> dict:
-    stats = {}
+def stats_for_deal(df_deal):
+    result = {}
     for cd in CHART_DEFS:
-        s = df_deal[cd["col"]].dropna()
-        stats[cd["col"]] = {
-            "latest": s.iloc[-1]  if len(s) else None,
-            "min":    s.min()     if len(s) else None,
-            "max":    s.max()     if len(s) else None,
-            "mean":   s.mean()    if len(s) else None,
+        s    = df_deal[cd["col"]].dropna()
+        freq = detect_frequency(df_deal["date"], df_deal[cd["col"]])
+        result[cd["col"]] = {
+            "latest":    float(s.iloc[-1]) if len(s) else None,
+            "min":       float(s.min())    if len(s) else None,
+            "max":       float(s.max())    if len(s) else None,
+            "mean":      float(s.mean())   if len(s) else None,
+            "frequency": freq,
         }
-    return stats
-
-
-def fmt_val(v, cd):
-    if v is None:
-        return "—"
-    if cd["unit"] == "%":
-        return f"{v:{cd['fmt']}}{cd['unit']}"
-    return f"{v:{cd['fmt']}}"
+    return result
 
 
 # ─── HTML template ────────────────────────────────────────────────────────────
@@ -246,37 +329,23 @@ HTML_TEMPLATE = """\
   --surf:   {surface};
   --surf2:  {surface2};
   --border: {border};
-  --a1:     {accent1};
-  --a2:     {accent2};
-  --a3:     {accent3};
-  --a4:     {accent4};
-  --text:   {text};
-  --dim:    {text_dim};
+  --a1:{accent1};--a2:{accent2};--a3:{accent3};--a4:{accent4};
+  --text:{text};--dim:{text_dim};
 }}
 html,body{{height:100%;background:var(--bg);color:var(--text);font-family:'DM Mono',monospace;overflow:hidden}}
-/* Layout */
 .shell{{display:grid;grid-template-columns:260px 1fr;height:100vh}}
-/* Sidebar */
-.sidebar{{
-  background:var(--surf);border-right:1px solid var(--border);
-  display:flex;flex-direction:column;overflow:hidden;
-}}
+.sidebar{{background:var(--surf);border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}}
 .sidebar-header{{padding:22px 20px 14px;border-bottom:1px solid var(--border)}}
-.sidebar-header h1{{
-  font-family:'Syne',sans-serif;font-size:1.1rem;font-weight:800;
-  letter-spacing:.04em;line-height:1.2;color:var(--text);
-}}
+.sidebar-header h1{{font-family:'Syne',sans-serif;font-size:1.1rem;font-weight:800;letter-spacing:.04em}}
 .sidebar-header p{{font-size:.68rem;color:var(--dim);margin-top:4px;letter-spacing:.06em;text-transform:uppercase}}
 .search-wrap{{padding:12px 14px}}
 .search-wrap input{{
-  width:100%;background:var(--surf2);border:1px solid var(--border);
-  border-radius:6px;padding:8px 12px;color:var(--text);font-family:'DM Mono',monospace;
-  font-size:.8rem;outline:none;transition:border-color .2s;
+  width:100%;background:var(--surf2);border:1px solid var(--border);border-radius:6px;
+  padding:8px 12px;color:var(--text);font-family:'DM Mono',monospace;font-size:.8rem;outline:none;transition:border-color .2s;
 }}
 .search-wrap input:focus{{border-color:var(--a1)}}
 .deal-list{{flex:1;overflow-y:auto;padding:0 8px 12px}}
 .deal-list::-webkit-scrollbar{{width:4px}}
-.deal-list::-webkit-scrollbar-track{{background:transparent}}
 .deal-list::-webkit-scrollbar-thumb{{background:var(--border);border-radius:2px}}
 .deal-btn{{
   display:block;width:100%;text-align:left;padding:9px 12px;margin-bottom:3px;
@@ -285,46 +354,41 @@ html,body{{height:100%;background:var(--bg);color:var(--text);font-family:'DM Mo
   cursor:pointer;transition:all .18s;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
 }}
 .deal-btn:hover{{background:var(--surf2);border-color:var(--border);color:var(--text)}}
-.deal-btn.active{{
-  background:rgba(56,189,248,.12);border-color:var(--a1);
-  color:var(--a1);font-weight:500;
-}}
+.deal-btn.active{{background:rgba(56,189,248,.12);border-color:var(--a1);color:var(--a1);font-weight:500}}
 .deal-count{{padding:0 14px 10px;font-size:.68rem;color:var(--dim);letter-spacing:.05em}}
-/* Main */
 .main{{display:flex;flex-direction:column;overflow:hidden;background:var(--bg)}}
-.topbar{{
-  display:flex;align-items:center;gap:16px;padding:14px 24px;
-  border-bottom:1px solid var(--border);flex-shrink:0;
-}}
+.topbar{{display:flex;align-items:center;gap:14px;padding:14px 24px;border-bottom:1px solid var(--border);flex-shrink:0}}
 .deal-title{{font-family:'Syne',sans-serif;font-size:1.3rem;font-weight:800;letter-spacing:.02em}}
-.deal-obs{{font-size:.72rem;color:var(--dim);margin-left:auto}}
-/* KPI strip */
-.kpi-strip{{display:flex;gap:12px;padding:12px 24px;flex-shrink:0}}
+.topbar-right{{margin-left:auto;display:flex;align-items:center;gap:10px}}
+.deal-obs{{font-size:.72rem;color:var(--dim)}}
+.q-badge{{
+  font-size:.63rem;padding:3px 9px;border-radius:4px;letter-spacing:.07em;text-transform:uppercase;
+  background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.3);color:var(--a3);display:none;
+}}
+.kpi-strip{{display:flex;gap:10px;padding:10px 24px;flex-shrink:0}}
 .kpi{{
-  flex:1;background:var(--surf);border:1px solid var(--border);
-  border-radius:10px;padding:12px 16px;position:relative;overflow:hidden;
+  flex:1;background:var(--surf);border:1px solid var(--border);border-radius:10px;
+  padding:11px 14px;position:relative;overflow:hidden;transition:border-color .2s;
 }}
-.kpi::before{{
-  content:'';position:absolute;inset:0;opacity:.06;
+.kpi::before{{content:'';position:absolute;inset:0;opacity:.05}}
+.kpi-icon{{font-size:.9rem;margin-bottom:3px;opacity:.7}}
+.kpi-label{{font-size:.6rem;color:var(--dim);letter-spacing:.08em;text-transform:uppercase;margin-bottom:5px}}
+.kpi-value{{font-size:1.15rem;font-weight:500;letter-spacing:.02em}}
+.kpi-range{{font-size:.62rem;color:var(--dim);margin-top:3px}}
+.kpi-freq-tag{{
+  display:inline-block;font-size:.55rem;padding:1px 5px;border-radius:3px;margin-top:5px;
+  background:rgba(248,113,113,.12);border:1px solid rgba(248,113,113,.25);
+  color:var(--a3);letter-spacing:.06em;text-transform:uppercase;
 }}
-.kpi-icon{{font-size:1.1rem;margin-bottom:4px}}
-.kpi-label{{font-size:.62rem;color:var(--dim);letter-spacing:.08em;text-transform:uppercase;margin-bottom:6px}}
-.kpi-value{{font-size:1.2rem;font-weight:500;letter-spacing:.02em}}
-.kpi-range{{font-size:.65rem;color:var(--dim);margin-top:3px}}
 .kpi.c1 .kpi-value{{color:var(--a1)}} .kpi.c1::before{{background:var(--a1)}}
 .kpi.c2 .kpi-value{{color:var(--a2)}} .kpi.c2::before{{background:var(--a2)}}
 .kpi.c3 .kpi-value{{color:var(--a3)}} .kpi.c3::before{{background:var(--a3)}}
 .kpi.c4 .kpi-value{{color:var(--a4)}} .kpi.c4::before{{background:var(--a4)}}
-/* Chart area */
-.charts-area{{flex:1;padding:4px 24px 16px;min-height:0}}
+.kpi.is-quarterly{{border-color:rgba(248,113,113,.22)}}
+.charts-area{{flex:1;padding:4px 24px 14px;min-height:0}}
 #plot{{width:100%;height:100%}}
-/* Empty state */
-.empty{{
-  flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;
-  color:var(--dim);font-size:.85rem;letter-spacing:.06em;text-transform:uppercase;
-}}
+.empty{{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;color:var(--dim);font-size:.85rem;letter-spacing:.06em;text-transform:uppercase}}
 .empty span{{font-size:2.5rem;opacity:.25}}
-/* Scrollbar global */
 ::-webkit-scrollbar{{width:5px;height:5px}}
 ::-webkit-scrollbar-track{{background:transparent}}
 ::-webkit-scrollbar-thumb{{background:var(--border);border-radius:3px}}
@@ -332,53 +396,44 @@ html,body{{height:100%;background:var(--bg);color:var(--text);font-family:'DM Mo
 </head>
 <body>
 <div class="shell">
-
-  <!-- SIDEBAR -->
   <aside class="sidebar">
     <div class="sidebar-header">
       <h1>Deal Performance</h1>
       <p>Analytics Dashboard</p>
     </div>
     <div class="search-wrap">
-      <input type="text" id="search" placeholder="Search deals…" oninput="filterDeals(this.value)"/>
+      <input type="text" id="search" placeholder="Search deals..." oninput="filterDeals(this.value)"/>
     </div>
     <div class="deal-count" id="deal-count"></div>
     <div class="deal-list" id="deal-list"></div>
   </aside>
 
-  <!-- MAIN -->
-  <main class="main" id="main-content">
+  <main class="main">
     <div class="empty" id="empty-state">
-      <span>◈</span>
-      <div>Select a deal to begin</div>
+      <span>o</span><div>Select a deal to begin</div>
     </div>
-
     <div id="dash-view" style="display:none;flex-direction:column;height:100%">
-      <!-- Top bar -->
       <div class="topbar">
-        <div class="deal-title" id="deal-title">—</div>
-        <div class="deal-obs" id="deal-obs"></div>
+        <div class="deal-title" id="deal-title">-</div>
+        <div class="topbar-right">
+          <div class="q-badge" id="q-badge">Quarterly metrics present</div>
+          <div class="deal-obs" id="deal-obs"></div>
+        </div>
       </div>
-      <!-- KPIs -->
       <div class="kpi-strip" id="kpi-strip"></div>
-      <!-- Charts -->
       <div class="charts-area"><div id="plot"></div></div>
     </div>
   </main>
-
 </div>
 
 <script>
-// ── Data injected by Python ───────────────────────────────────────────────
 const ALL_DEALS   = {deals_json};
 const ALL_FIGURES = {figures_json};
 const ALL_STATS   = {stats_json};
 const CHART_DEFS  = {chart_defs_json};
 
-// ── State ─────────────────────────────────────────────────────────────────
 let currentDeal = null;
 
-// ── Build sidebar ─────────────────────────────────────────────────────────
 function buildSidebar(deals) {{
   const list = document.getElementById('deal-list');
   list.innerHTML = '';
@@ -395,63 +450,60 @@ function buildSidebar(deals) {{
 }}
 
 function filterDeals(q) {{
-  const filtered = ALL_DEALS.filter(d => d.toLowerCase().includes(q.toLowerCase()));
-  buildSidebar(filtered);
+  buildSidebar(ALL_DEALS.filter(d => d.toLowerCase().includes(q.toLowerCase())));
 }}
 
-// ── Select deal ───────────────────────────────────────────────────────────
+function fmtVal(v, cd) {{
+  if (v === null || v === undefined) return '-';
+  if (cd.unit === '%') return v.toFixed(2) + '%';
+  return new Intl.NumberFormat('en-US', {{notation:'compact', maximumFractionDigits:1}}).format(v);
+}}
+
 function selectDeal(deal) {{
   currentDeal = deal;
-  // Sidebar highlight
   document.querySelectorAll('.deal-btn').forEach(b =>
     b.classList.toggle('active', b.dataset.deal === deal));
 
-  // Show dashboard
-  document.getElementById('empty-state').style.display  = 'none';
-  const dv = document.getElementById('dash-view');
-  dv.style.display = 'flex';
-
+  document.getElementById('empty-state').style.display = 'none';
+  document.getElementById('dash-view').style.display   = 'flex';
   document.getElementById('deal-title').textContent = deal;
 
-  // Observation count
-  const fig = ALL_FIGURES[deal];
+  const fig  = ALL_FIGURES[deal];
   const obs  = fig ? fig.data[0].x.length : 0;
-  document.getElementById('deal-obs').textContent = obs + ' observations';
+  document.getElementById('deal-obs').textContent = obs + ' obs';
 
-  // KPIs
-  const stats = ALL_STATS[deal] || {{}};
-  const strip  = document.getElementById('kpi-strip');
+  const stats       = ALL_STATS[deal] || {{}};
+  const hasQuarterly = CHART_DEFS.some(cd => (stats[cd.col] || {{}}).frequency === 'quarterly');
+  document.getElementById('q-badge').style.display = hasQuarterly ? 'inline-block' : 'none';
+
+  // KPI cards
+  const strip = document.getElementById('kpi-strip');
   strip.innerHTML = '';
   CHART_DEFS.forEach((cd, i) => {{
     const s   = stats[cd.col] || {{}};
-    const cls = 'c' + (i+1);
-    const fmtV = v => {{
-      if (v === null || v === undefined) return '—';
-      if (cd.unit === '%') return v.toFixed(2) + '%';
-      return new Intl.NumberFormat('en-US', {{notation:'compact',maximumFractionDigits:1}}).format(v);
-    }};
+    const isQ = s.frequency === 'quarterly';
     strip.innerHTML += `
-      <div class="kpi ${{cls}}">
+      <div class="kpi c${{i+1}}${{isQ ? ' is-quarterly' : ''}}">
         <div class="kpi-icon">${{cd.icon}}</div>
         <div class="kpi-label">${{cd.label}}</div>
-        <div class="kpi-value">${{fmtV(s.latest)}}</div>
-        <div class="kpi-range">↓${{fmtV(s.min)}} · ↑${{fmtV(s.max)}}</div>
+        <div class="kpi-value">${{fmtVal(s.latest, cd)}}</div>
+        <div class="kpi-range">min ${{fmtVal(s.min, cd)}} / max ${{fmtVal(s.max, cd)}}</div>
+        ${{isQ ? '<span class="kpi-freq-tag">quarterly</span>' : ''}}
       </div>`;
   }});
 
-  // Plotly chart
+  // Plot
   if (fig) {{
     Plotly.newPlot('plot', fig.data, fig.layout, {{
       responsive: true,
       displayModeBar: true,
       displaylogo: false,
       modeBarButtonsToRemove: ['select2d','lasso2d','autoScale2d'],
-      toImageButtonOptions: {{format:'svg',filename: deal + '_dashboard'}},
+      toImageButtonOptions: {{format:'svg', filename: deal + '_dashboard'}},
     }});
   }}
 }}
 
-// ── Init ──────────────────────────────────────────────────────────────────
 buildSidebar(ALL_DEALS);
 if (ALL_DEALS.length > 0) selectDeal(ALL_DEALS[0]);
 </script>
@@ -460,48 +512,36 @@ if (ALL_DEALS.length > 0) selectDeal(ALL_DEALS[0]);
 """
 
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
+# ─── Run ──────────────────────────────────────────────────────────────────────
 
-def main():
-    parser = argparse.ArgumentParser(description="Deal Performance Dashboard Generator")
-    parser.add_argument("--input",  required=True, help="Path to Excel file (.xlsx)")
-    parser.add_argument("--output", default="dashboard.html", help="Output HTML file (default: dashboard.html)")
-    args = parser.parse_args()
+print(f"\n  Reading: {INPUT_FILE}\n")
+df = load_excel(INPUT_FILE)
 
-    print(f"📂  Reading: {args.input}")
-    df = load_excel(args.input)
+deals = sorted(df["deal"].unique().tolist())
+print(f"\n  {len(deals)} deal(s) loaded: {deals[:6]}{'...' if len(deals) > 6 else ''}\n")
 
-    deals = sorted(df["Deal"].unique().tolist())
-    print(f"✅  Found {len(deals)} deal(s): {deals[:5]}{'…' if len(deals) > 5 else ''}")
+figures_dict = {}
+stats_dict   = {}
 
-    figures_dict = {}
-    stats_dict   = {}
+for deal in deals:
+    df_d = df[df["deal"] == deal].copy()
+    figures_dict[deal] = json.loads(pio.to_json(build_figure(df_d, deal)))
+    stats_dict[deal]   = stats_for_deal(df_d)
 
-    for deal in deals:
-        df_d = df[df["Deal"] == deal].copy()
-        fig  = build_figure(df_d, deal)
-        figures_dict[deal] = json.loads(pio.to_json(fig))
-        stats_dict[deal]   = stats_for_deal(df_d)
+chart_defs_js = [
+    {"col": cd["col"], "label": cd["label"], "unit": cd["unit"], "icon": cd["icon"]}
+    for cd in CHART_DEFS
+]
 
-    # Serialise chart def metadata for JS
-    chart_defs_js = [
-        {"col": cd["col"], "label": cd["label"], "unit": cd["unit"], "icon": cd["icon"]}
-        for cd in CHART_DEFS
-    ]
+html = HTML_TEMPLATE.format(
+    **PALETTE,
+    deals_json      = json.dumps(deals),
+    figures_json    = json.dumps(figures_dict),
+    stats_json      = json.dumps(stats_dict),
+    chart_defs_json = json.dumps(chart_defs_js),
+)
 
-    html = HTML_TEMPLATE.format(
-        **PALETTE,
-        deals_json      = json.dumps(deals),
-        figures_json    = json.dumps(figures_dict),
-        stats_json      = json.dumps(stats_dict),
-        chart_defs_json = json.dumps(chart_defs_js),
-    )
-
-    out_path = Path(args.output)
-    out_path.write_text(html, encoding="utf-8")
-    print(f"🎉  Dashboard saved → {out_path.resolve()}")
-    print(f"    Open in any modern browser. No server required.")
-
-
-if __name__ == "__main__":
-    main()
+out_path = Path(OUTPUT_FILE)
+out_path.write_text(html, encoding="utf-8")
+print(f"  Dashboard saved: {out_path.resolve()}")
+print(f"  Open in any modern browser - no server required.\n")
