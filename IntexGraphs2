@@ -1,3 +1,85 @@
+def build_index(df):
+    required = ["deal", "date", "collat_bal", "dlq90", "cpr", "cdr"]
+
+    missing_cols = [c for c in required if c not in df.columns]
+    if missing_cols:
+        raise KeyError(
+            f"build_index() is missing required columns: {missing_cols}. "
+            f"Available columns: {list(df.columns)}"
+        )
+
+    rows = []
+    coverage = {
+        "dlq90": [],
+        "cpr": [],
+        "cdr": [],
+    }
+
+    source_deal_count = df["deal"].dropna().nunique()
+    all_dates = sorted(df["date"].dropna().unique())
+
+    # Always return a DataFrame with the expected schema,
+    # even if there are no valid dates.
+    output_columns = ["deal", "date", "_sheet", "collat_bal", "dlq90", "cpr", "cdr"]
+
+    if len(all_dates) == 0:
+        print("Index build summary:")
+        print(f"  Source deals: {source_deal_count}")
+        print("  Date points: 0")
+        print("  Warning: no valid dates available to build index.")
+
+        return pd.DataFrame(columns=output_columns)
+
+    for dt in all_dates:
+        day = df[df["date"] == dt]
+
+        row = {
+            "deal": INDEX_DEAL_NAME,
+            "date": dt,
+            "_sheet": "INDEX",
+            "collat_bal": day["collat_bal"].dropna().sum(),
+            "dlq90": np.nan,
+            "cpr": np.nan,
+            "cdr": np.nan,
+        }
+
+        for metric in ["dlq90", "cpr", "cdr"]:
+            valid = day[[metric, "collat_bal", "deal"]].dropna(subset=[metric, "collat_bal"])
+
+            if valid.empty or valid["collat_bal"].sum() == 0:
+                row[metric] = np.nan
+                coverage[metric].append(0)
+            else:
+                row[metric] = (
+                    valid[metric].mul(valid["collat_bal"]).sum()
+                    / valid["collat_bal"].sum()
+                )
+                coverage[metric].append(valid["deal"].nunique())
+
+        rows.append(row)
+
+    index_df = pd.DataFrame(rows, columns=output_columns)
+
+    print("Index build summary:")
+    print(f"  Source deals: {source_deal_count}")
+    print(f"  Date points: {len(index_df)}")
+
+    for metric in ["dlq90", "cpr", "cdr"]:
+        counts = pd.Series(coverage[metric], dtype="float64")
+
+        if counts.empty:
+            print(f"  {metric}: avg=nan, min=nan, max=nan deals per period")
+        else:
+            print(
+                f"  {metric}: "
+                f"avg={counts.mean():.2f}, "
+                f"min={counts.min():.0f}, "
+                f"max={counts.max():.0f} deals per period"
+            )
+
+    return index_df
+
+
 # ============================================================
 # Deal Performance Interactive Dashboard Generator
 # Jupyter notebook usage:
