@@ -1,0 +1,507 @@
+#!/usr/bin/env python3
+"""
+Deal Performance Dashboard Generator
+Reads an Excel file with deal performance data and generates an interactive HTML dashboard.
+
+Usage:
+    python generate_dashboard.py --input your_file.xlsx --output dashboard.html
+
+Required columns (per worksheet):
+    Deal, date, collat_bal, 1mo_dlq90_reported, 3mo_cpr_reported, 3mo_cdr_reported
+"""
+
+import argparse
+import sys
+import json
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import plotly.io as pio
+from pathlib import Path
+
+
+# ─── Colour palette ──────────────────────────────────────────────────────────
+PALETTE = {
+    "bg":           "#0b0f1a",
+    "surface":      "#111827",
+    "surface2":     "#1a2235",
+    "border":       "#1f2d45",
+    "accent1":      "#38bdf8",   # sky   – DLQ90
+    "accent2":      "#34d399",   # emerald – CPR
+    "accent3":      "#f87171",   # red   – CDR
+    "accent4":      "#a78bfa",   # violet – Collat Bal
+    "text":         "#e2e8f0",
+    "text_dim":     "#64748b",
+    "grid":         "#1e2d3d",
+}
+
+CHART_DEFS = [
+    {
+        "col":    "1mo_dlq90_reported",
+        "label":  "DLQ 90+",
+        "unit":   "%",
+        "color":  PALETTE["accent1"],
+        "fill":   "rgba(56,189,248,0.08)",
+        "icon":   "⚠",
+        "fmt":    ".2f",
+    },
+    {
+        "col":    "3mo_cpr_reported",
+        "label":  "3-Mo CPR",
+        "unit":   "%",
+        "color":  PALETTE["accent2"],
+        "fill":   "rgba(52,211,153,0.08)",
+        "icon":   "⟳",
+        "fmt":    ".2f",
+    },
+    {
+        "col":    "3mo_cdr_reported",
+        "label":  "3-Mo CDR",
+        "unit":   "%",
+        "color":  PALETTE["accent3"],
+        "fill":   "rgba(248,113,113,0.08)",
+        "icon":   "↓",
+        "fmt":    ".2f",
+    },
+    {
+        "col":    "collat_bal",
+        "label":  "Collateral Balance",
+        "unit":   "",
+        "color":  PALETTE["accent4"],
+        "fill":   "rgba(167,139,250,0.08)",
+        "icon":   "$",
+        "fmt":    ",.0f",
+    },
+]
+
+REQUIRED_COLS = {"Deal", "date",
+                 "collat_bal", "1mo_dlq90_reported",
+                 "3mo_cpr_reported", "3mo_cdr_reported"}
+
+
+# ─── Data loading ─────────────────────────────────────────────────────────────
+
+def load_excel(path: str) -> pd.DataFrame:
+    """Load all worksheets, stack them, and return a clean DataFrame."""
+    xl = pd.ExcelFile(path)
+    frames = []
+    for sheet in xl.sheet_names:
+        df = xl.parse(sheet)
+        # Normalise column names: strip whitespace, lower-case for matching
+        df.columns = df.columns.str.strip()
+        # Case-insensitive rename to canonical names
+        col_map = {c: c for c in df.columns}
+        for canon in list(REQUIRED_COLS):
+            for raw in df.columns:
+                if raw.lower() == canon.lower() and raw != canon:
+                    col_map[raw] = canon
+        df = df.rename(columns=col_map)
+        missing = REQUIRED_COLS - set(df.columns)
+        if missing:
+            print(f"  [skip] Sheet '{sheet}' missing columns: {missing}")
+            continue
+        df["_sheet"] = sheet
+        frames.append(df[list(REQUIRED_COLS) + ["_sheet"]])
+
+    if not frames:
+        sys.exit("ERROR: No usable worksheets found. Check column names.")
+
+    out = pd.concat(frames, ignore_index=True)
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    out = out.dropna(subset=["date", "Deal"])
+    out["Deal"] = out["Deal"].astype(str).str.strip()
+    for c in ["collat_bal", "1mo_dlq90_reported", "3mo_cpr_reported", "3mo_cdr_reported"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+    out = out.sort_values(["Deal", "date"])
+    return out
+
+
+# ─── Plotly figure builder ────────────────────────────────────────────────────
+
+def build_figure(df_deal: pd.DataFrame, deal_name: str) -> go.Figure:
+    """Build a 2×2 subplot figure for one deal."""
+    fig = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=[c["label"] for c in CHART_DEFS],
+        vertical_spacing=0.14,
+        horizontal_spacing=0.10,
+    )
+    positions = [(1, 1), (1, 2), (2, 1), (2, 2)]
+
+    for cd, (row, col) in zip(CHART_DEFS, positions):
+        series = df_deal[cd["col"]].copy()
+        dates  = df_deal["date"]
+
+        # Latest value for annotation
+        latest = series.dropna().iloc[-1] if not series.dropna().empty else None
+
+        # Area trace
+        fig.add_trace(
+            go.Scatter(
+                x=dates, y=series,
+                mode="lines",
+                name=cd["label"],
+                line=dict(color=cd["color"], width=2.5, shape="spline", smoothing=0.4),
+                fill="tozeroy",
+                fillcolor=cd["fill"],
+                hovertemplate=f"<b>%{{x|%b %Y}}</b><br>{cd['label']}: %{{y:{cd['fmt']}}}{cd['unit']}<extra></extra>",
+            ),
+            row=row, col=col,
+        )
+
+        # Dot for latest value
+        if latest is not None:
+            fig.add_trace(
+                go.Scatter(
+                    x=[dates.iloc[-1]], y=[latest],
+                    mode="markers",
+                    marker=dict(color=cd["color"], size=9, line=dict(color="#0b0f1a", width=2)),
+                    showlegend=False,
+                    hoverinfo="skip",
+                ),
+                row=row, col=col,
+            )
+
+        # Axis formatting
+        axis_kwargs = dict(
+            showgrid=True, gridcolor=PALETTE["grid"], gridwidth=1,
+            zeroline=False,
+            tickfont=dict(color=PALETTE["text_dim"], size=10, family="'DM Mono', monospace"),
+            linecolor=PALETTE["border"],
+        )
+        y_suffix = cd["unit"] if cd["unit"] in ("%",) else ""
+        y_fmt    = ".1f" if cd["unit"] == "%" else ",.3s"
+
+        fig.update_xaxes(
+            **axis_kwargs,
+            tickformat="%b %Y",
+            row=row, col=col,
+        )
+        fig.update_yaxes(
+            **axis_kwargs,
+            ticksuffix=y_suffix,
+            tickformat=y_fmt,
+            row=row, col=col,
+        )
+
+    # Subplot title colour
+    for ann in fig.layout.annotations:
+        ann.update(font=dict(color=PALETTE["text"], size=13, family="'Syne', sans-serif"),
+                   x=ann.x, y=ann.y)
+
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        showlegend=False,
+        margin=dict(l=40, r=20, t=55, b=30),
+        font=dict(family="'DM Mono', monospace", color=PALETTE["text"]),
+        hoverlabel=dict(
+            bgcolor=PALETTE["surface2"],
+            font_color=PALETTE["text"],
+            bordercolor=PALETTE["border"],
+        ),
+    )
+    return fig
+
+
+# ─── Per-deal stats helper ────────────────────────────────────────────────────
+
+def stats_for_deal(df_deal: pd.DataFrame) -> dict:
+    stats = {}
+    for cd in CHART_DEFS:
+        s = df_deal[cd["col"]].dropna()
+        stats[cd["col"]] = {
+            "latest": s.iloc[-1]  if len(s) else None,
+            "min":    s.min()     if len(s) else None,
+            "max":    s.max()     if len(s) else None,
+            "mean":   s.mean()    if len(s) else None,
+        }
+    return stats
+
+
+def fmt_val(v, cd):
+    if v is None:
+        return "—"
+    if cd["unit"] == "%":
+        return f"{v:{cd['fmt']}}{cd['unit']}"
+    return f"{v:{cd['fmt']}}"
+
+
+# ─── HTML template ────────────────────────────────────────────────────────────
+
+HTML_TEMPLATE = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Deal Performance Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;800&family=DM+Mono:wght@300;400;500&display=swap" rel="stylesheet"/>
+<script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+<style>
+*,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
+:root{{
+  --bg:     {bg};
+  --surf:   {surface};
+  --surf2:  {surface2};
+  --border: {border};
+  --a1:     {accent1};
+  --a2:     {accent2};
+  --a3:     {accent3};
+  --a4:     {accent4};
+  --text:   {text};
+  --dim:    {text_dim};
+}}
+html,body{{height:100%;background:var(--bg);color:var(--text);font-family:'DM Mono',monospace;overflow:hidden}}
+/* Layout */
+.shell{{display:grid;grid-template-columns:260px 1fr;height:100vh}}
+/* Sidebar */
+.sidebar{{
+  background:var(--surf);border-right:1px solid var(--border);
+  display:flex;flex-direction:column;overflow:hidden;
+}}
+.sidebar-header{{padding:22px 20px 14px;border-bottom:1px solid var(--border)}}
+.sidebar-header h1{{
+  font-family:'Syne',sans-serif;font-size:1.1rem;font-weight:800;
+  letter-spacing:.04em;line-height:1.2;color:var(--text);
+}}
+.sidebar-header p{{font-size:.68rem;color:var(--dim);margin-top:4px;letter-spacing:.06em;text-transform:uppercase}}
+.search-wrap{{padding:12px 14px}}
+.search-wrap input{{
+  width:100%;background:var(--surf2);border:1px solid var(--border);
+  border-radius:6px;padding:8px 12px;color:var(--text);font-family:'DM Mono',monospace;
+  font-size:.8rem;outline:none;transition:border-color .2s;
+}}
+.search-wrap input:focus{{border-color:var(--a1)}}
+.deal-list{{flex:1;overflow-y:auto;padding:0 8px 12px}}
+.deal-list::-webkit-scrollbar{{width:4px}}
+.deal-list::-webkit-scrollbar-track{{background:transparent}}
+.deal-list::-webkit-scrollbar-thumb{{background:var(--border);border-radius:2px}}
+.deal-btn{{
+  display:block;width:100%;text-align:left;padding:9px 12px;margin-bottom:3px;
+  background:transparent;border:1px solid transparent;border-radius:7px;
+  color:var(--dim);font-family:'DM Mono',monospace;font-size:.8rem;
+  cursor:pointer;transition:all .18s;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}}
+.deal-btn:hover{{background:var(--surf2);border-color:var(--border);color:var(--text)}}
+.deal-btn.active{{
+  background:rgba(56,189,248,.12);border-color:var(--a1);
+  color:var(--a1);font-weight:500;
+}}
+.deal-count{{padding:0 14px 10px;font-size:.68rem;color:var(--dim);letter-spacing:.05em}}
+/* Main */
+.main{{display:flex;flex-direction:column;overflow:hidden;background:var(--bg)}}
+.topbar{{
+  display:flex;align-items:center;gap:16px;padding:14px 24px;
+  border-bottom:1px solid var(--border);flex-shrink:0;
+}}
+.deal-title{{font-family:'Syne',sans-serif;font-size:1.3rem;font-weight:800;letter-spacing:.02em}}
+.deal-obs{{font-size:.72rem;color:var(--dim);margin-left:auto}}
+/* KPI strip */
+.kpi-strip{{display:flex;gap:12px;padding:12px 24px;flex-shrink:0}}
+.kpi{{
+  flex:1;background:var(--surf);border:1px solid var(--border);
+  border-radius:10px;padding:12px 16px;position:relative;overflow:hidden;
+}}
+.kpi::before{{
+  content:'';position:absolute;inset:0;opacity:.06;
+}}
+.kpi-icon{{font-size:1.1rem;margin-bottom:4px}}
+.kpi-label{{font-size:.62rem;color:var(--dim);letter-spacing:.08em;text-transform:uppercase;margin-bottom:6px}}
+.kpi-value{{font-size:1.2rem;font-weight:500;letter-spacing:.02em}}
+.kpi-range{{font-size:.65rem;color:var(--dim);margin-top:3px}}
+.kpi.c1 .kpi-value{{color:var(--a1)}} .kpi.c1::before{{background:var(--a1)}}
+.kpi.c2 .kpi-value{{color:var(--a2)}} .kpi.c2::before{{background:var(--a2)}}
+.kpi.c3 .kpi-value{{color:var(--a3)}} .kpi.c3::before{{background:var(--a3)}}
+.kpi.c4 .kpi-value{{color:var(--a4)}} .kpi.c4::before{{background:var(--a4)}}
+/* Chart area */
+.charts-area{{flex:1;padding:4px 24px 16px;min-height:0}}
+#plot{{width:100%;height:100%}}
+/* Empty state */
+.empty{{
+  flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;
+  color:var(--dim);font-size:.85rem;letter-spacing:.06em;text-transform:uppercase;
+}}
+.empty span{{font-size:2.5rem;opacity:.25}}
+/* Scrollbar global */
+::-webkit-scrollbar{{width:5px;height:5px}}
+::-webkit-scrollbar-track{{background:transparent}}
+::-webkit-scrollbar-thumb{{background:var(--border);border-radius:3px}}
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <!-- SIDEBAR -->
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <h1>Deal Performance</h1>
+      <p>Analytics Dashboard</p>
+    </div>
+    <div class="search-wrap">
+      <input type="text" id="search" placeholder="Search deals…" oninput="filterDeals(this.value)"/>
+    </div>
+    <div class="deal-count" id="deal-count"></div>
+    <div class="deal-list" id="deal-list"></div>
+  </aside>
+
+  <!-- MAIN -->
+  <main class="main" id="main-content">
+    <div class="empty" id="empty-state">
+      <span>◈</span>
+      <div>Select a deal to begin</div>
+    </div>
+
+    <div id="dash-view" style="display:none;flex-direction:column;height:100%">
+      <!-- Top bar -->
+      <div class="topbar">
+        <div class="deal-title" id="deal-title">—</div>
+        <div class="deal-obs" id="deal-obs"></div>
+      </div>
+      <!-- KPIs -->
+      <div class="kpi-strip" id="kpi-strip"></div>
+      <!-- Charts -->
+      <div class="charts-area"><div id="plot"></div></div>
+    </div>
+  </main>
+
+</div>
+
+<script>
+// ── Data injected by Python ───────────────────────────────────────────────
+const ALL_DEALS   = {deals_json};
+const ALL_FIGURES = {figures_json};
+const ALL_STATS   = {stats_json};
+const CHART_DEFS  = {chart_defs_json};
+
+// ── State ─────────────────────────────────────────────────────────────────
+let currentDeal = null;
+
+// ── Build sidebar ─────────────────────────────────────────────────────────
+function buildSidebar(deals) {{
+  const list = document.getElementById('deal-list');
+  list.innerHTML = '';
+  deals.forEach(d => {{
+    const btn = document.createElement('button');
+    btn.className = 'deal-btn' + (d === currentDeal ? ' active' : '');
+    btn.textContent = d;
+    btn.dataset.deal = d;
+    btn.onclick = () => selectDeal(d);
+    list.appendChild(btn);
+  }});
+  document.getElementById('deal-count').textContent =
+    deals.length + ' deal' + (deals.length !== 1 ? 's' : '');
+}}
+
+function filterDeals(q) {{
+  const filtered = ALL_DEALS.filter(d => d.toLowerCase().includes(q.toLowerCase()));
+  buildSidebar(filtered);
+}}
+
+// ── Select deal ───────────────────────────────────────────────────────────
+function selectDeal(deal) {{
+  currentDeal = deal;
+  // Sidebar highlight
+  document.querySelectorAll('.deal-btn').forEach(b =>
+    b.classList.toggle('active', b.dataset.deal === deal));
+
+  // Show dashboard
+  document.getElementById('empty-state').style.display  = 'none';
+  const dv = document.getElementById('dash-view');
+  dv.style.display = 'flex';
+
+  document.getElementById('deal-title').textContent = deal;
+
+  // Observation count
+  const fig = ALL_FIGURES[deal];
+  const obs  = fig ? fig.data[0].x.length : 0;
+  document.getElementById('deal-obs').textContent = obs + ' observations';
+
+  // KPIs
+  const stats = ALL_STATS[deal] || {{}};
+  const strip  = document.getElementById('kpi-strip');
+  strip.innerHTML = '';
+  CHART_DEFS.forEach((cd, i) => {{
+    const s   = stats[cd.col] || {{}};
+    const cls = 'c' + (i+1);
+    const fmtV = v => {{
+      if (v === null || v === undefined) return '—';
+      if (cd.unit === '%') return v.toFixed(2) + '%';
+      return new Intl.NumberFormat('en-US', {{notation:'compact',maximumFractionDigits:1}}).format(v);
+    }};
+    strip.innerHTML += `
+      <div class="kpi ${{cls}}">
+        <div class="kpi-icon">${{cd.icon}}</div>
+        <div class="kpi-label">${{cd.label}}</div>
+        <div class="kpi-value">${{fmtV(s.latest)}}</div>
+        <div class="kpi-range">↓${{fmtV(s.min)}} · ↑${{fmtV(s.max)}}</div>
+      </div>`;
+  }});
+
+  // Plotly chart
+  if (fig) {{
+    Plotly.newPlot('plot', fig.data, fig.layout, {{
+      responsive: true,
+      displayModeBar: true,
+      displaylogo: false,
+      modeBarButtonsToRemove: ['select2d','lasso2d','autoScale2d'],
+      toImageButtonOptions: {{format:'svg',filename: deal + '_dashboard'}},
+    }});
+  }}
+}}
+
+// ── Init ──────────────────────────────────────────────────────────────────
+buildSidebar(ALL_DEALS);
+if (ALL_DEALS.length > 0) selectDeal(ALL_DEALS[0]);
+</script>
+</body>
+</html>
+"""
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="Deal Performance Dashboard Generator")
+    parser.add_argument("--input",  required=True, help="Path to Excel file (.xlsx)")
+    parser.add_argument("--output", default="dashboard.html", help="Output HTML file (default: dashboard.html)")
+    args = parser.parse_args()
+
+    print(f"📂  Reading: {args.input}")
+    df = load_excel(args.input)
+
+    deals = sorted(df["Deal"].unique().tolist())
+    print(f"✅  Found {len(deals)} deal(s): {deals[:5]}{'…' if len(deals) > 5 else ''}")
+
+    figures_dict = {}
+    stats_dict   = {}
+
+    for deal in deals:
+        df_d = df[df["Deal"] == deal].copy()
+        fig  = build_figure(df_d, deal)
+        figures_dict[deal] = json.loads(pio.to_json(fig))
+        stats_dict[deal]   = stats_for_deal(df_d)
+
+    # Serialise chart def metadata for JS
+    chart_defs_js = [
+        {"col": cd["col"], "label": cd["label"], "unit": cd["unit"], "icon": cd["icon"]}
+        for cd in CHART_DEFS
+    ]
+
+    html = HTML_TEMPLATE.format(
+        **PALETTE,
+        deals_json      = json.dumps(deals),
+        figures_json    = json.dumps(figures_dict),
+        stats_json      = json.dumps(stats_dict),
+        chart_defs_json = json.dumps(chart_defs_js),
+    )
+
+    out_path = Path(args.output)
+    out_path.write_text(html, encoding="utf-8")
+    print(f"🎉  Dashboard saved → {out_path.resolve()}")
+    print(f"    Open in any modern browser. No server required.")
+
+
+if __name__ == "__main__":
+    main()
