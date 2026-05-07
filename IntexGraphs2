@@ -1,91 +1,7 @@
-def build_index(df):
-    required = ["deal", "date", "collat_bal", "dlq90", "cpr", "cdr"]
-
-    missing_cols = [c for c in required if c not in df.columns]
-    if missing_cols:
-        raise KeyError(
-            f"build_index() is missing required columns: {missing_cols}. "
-            f"Available columns: {list(df.columns)}"
-        )
-
-    rows = []
-    coverage = {
-        "dlq90": [],
-        "cpr": [],
-        "cdr": [],
-    }
-
-    source_deal_count = df["deal"].dropna().nunique()
-    all_dates = sorted(df["date"].dropna().unique())
-
-    # Always return a DataFrame with the expected schema,
-    # even if there are no valid dates.
-    output_columns = ["deal", "date", "_sheet", "collat_bal", "dlq90", "cpr", "cdr"]
-
-    if len(all_dates) == 0:
-        print("Index build summary:")
-        print(f"  Source deals: {source_deal_count}")
-        print("  Date points: 0")
-        print("  Warning: no valid dates available to build index.")
-
-        return pd.DataFrame(columns=output_columns)
-
-    for dt in all_dates:
-        day = df[df["date"] == dt]
-
-        row = {
-            "deal": INDEX_DEAL_NAME,
-            "date": dt,
-            "_sheet": "INDEX",
-            "collat_bal": day["collat_bal"].dropna().sum(),
-            "dlq90": np.nan,
-            "cpr": np.nan,
-            "cdr": np.nan,
-        }
-
-        for metric in ["dlq90", "cpr", "cdr"]:
-            valid = day[[metric, "collat_bal", "deal"]].dropna(subset=[metric, "collat_bal"])
-
-            if valid.empty or valid["collat_bal"].sum() == 0:
-                row[metric] = np.nan
-                coverage[metric].append(0)
-            else:
-                row[metric] = (
-                    valid[metric].mul(valid["collat_bal"]).sum()
-                    / valid["collat_bal"].sum()
-                )
-                coverage[metric].append(valid["deal"].nunique())
-
-        rows.append(row)
-
-    index_df = pd.DataFrame(rows, columns=output_columns)
-
-    print("Index build summary:")
-    print(f"  Source deals: {source_deal_count}")
-    print(f"  Date points: {len(index_df)}")
-
-    for metric in ["dlq90", "cpr", "cdr"]:
-        counts = pd.Series(coverage[metric], dtype="float64")
-
-        if counts.empty:
-            print(f"  {metric}: avg=nan, min=nan, max=nan deals per period")
-        else:
-            print(
-                f"  {metric}: "
-                f"avg={counts.mean():.2f}, "
-                f"min={counts.min():.0f}, "
-                f"max={counts.max():.0f} deals per period"
-            )
-
-    return index_df
-
-
 # ============================================================
 # Deal Performance Interactive Dashboard Generator
-# Jupyter notebook usage:
-#   1. Set INPUT_FILE and OUTPUT_FILE below
-#   2. Run this cell
-#   3. Open OUTPUT_FILE in a browser
+# Jupyter usage:
+#   Set INPUT_FILE and OUTPUT_FILE only, then run the cell.
 # ============================================================
 
 INPUT_FILE = "deal_performance.xlsx"
@@ -97,7 +13,6 @@ OUTPUT_FILE = "deal_performance_dashboard.html"
 
 import json
 import math
-import html
 from pathlib import Path
 
 import numpy as np
@@ -149,6 +64,8 @@ COLUMN_ALIASES = {
     ],
 }
 
+CANONICAL_COLUMNS = ["deal", "date", "collat_bal", "dlq90", "cpr", "cdr"]
+
 METRICS = {
     "dlq90": {
         "label": "DLQ 90+",
@@ -188,11 +105,9 @@ METRICS = {
     },
 }
 
-CANONICAL_COLUMNS = ["deal", "date", "collat_bal", "dlq90", "cpr", "cdr"]
-
 
 # ============================================================
-# Helpers
+# Utility functions
 # ============================================================
 
 def normalize_col_name(x):
@@ -204,9 +119,10 @@ def resolve_columns(columns, aliases):
     Resolve raw worksheet columns to canonical column names.
 
     Matching is case-insensitive and strips whitespace.
-    The first matching alias wins.
+    First matching alias wins.
     """
     normalized_to_raw = {}
+
     for raw in columns:
         norm = normalize_col_name(raw)
         if norm not in normalized_to_raw:
@@ -216,17 +132,19 @@ def resolve_columns(columns, aliases):
     missing = []
 
     for canonical, alias_list in aliases.items():
-        found = None
+        match = None
+
         for alias in alias_list:
             alias_norm = normalize_col_name(alias)
+
             if alias_norm in normalized_to_raw:
-                found = normalized_to_raw[alias_norm]
+                match = normalized_to_raw[alias_norm]
                 break
 
-        if found is None:
+        if match is None:
             missing.append(canonical)
         else:
-            resolved[canonical] = found
+            resolved[canonical] = match
 
     return resolved, missing
 
@@ -239,37 +157,68 @@ def hex_to_rgba(hex_color, alpha):
     return f"rgba({r},{g},{b},{alpha})"
 
 
-def clean_for_json(obj):
+def json_safe(obj):
     """
-    Recursively convert NumPy / Pandas scalar objects into JSON-safe values.
+    Recursively convert pandas / numpy / datetime / NaN objects
+    into JSON-safe values.
     """
     if isinstance(obj, dict):
-        return {str(k): clean_for_json(v) for k, v in obj.items()}
+        return {str(k): json_safe(v) for k, v in obj.items()}
 
     if isinstance(obj, list):
-        return [clean_for_json(v) for v in obj]
+        return [json_safe(v) for v in obj]
 
     if isinstance(obj, tuple):
-        return [clean_for_json(v) for v in obj]
-
-    if pd.isna(obj) if not isinstance(obj, (list, tuple, dict)) else False:
-        return None
-
-    if isinstance(obj, (np.integer,)):
-        return int(obj)
-
-    if isinstance(obj, (np.floating,)):
-        if math.isnan(float(obj)):
-            return None
-        return float(obj)
-
-    if isinstance(obj, (np.bool_,)):
-        return bool(obj)
+        return [json_safe(v) for v in obj]
 
     if isinstance(obj, pd.Timestamp):
+        if pd.isna(obj):
+            return None
         return obj.isoformat()
 
+    if isinstance(obj, np.datetime64):
+        if pd.isna(obj):
+            return None
+        return pd.Timestamp(obj).isoformat()
+
+    if isinstance(obj, np.integer):
+        return int(obj)
+
+    if isinstance(obj, np.floating):
+        value = float(obj)
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return value
+
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+
+    if obj is pd.NaT:
+        return None
+
+    if obj is None:
+        return None
+
     return obj
+
+
+def dumps_js(obj):
+    """
+    JSON dump safe for embedding inside a script tag.
+    """
+    text = json.dumps(
+        json_safe(obj),
+        cls=PlotlyJSONEncoder,
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+
+    return text.replace("</", "<\\/")
 
 
 # ============================================================
@@ -279,11 +228,17 @@ def clean_for_json(obj):
 def load_excel_data(input_file):
     print(f"Reading file: {input_file}")
 
-    sheets = pd.read_excel(input_file, sheet_name=None)
-    loaded = []
+    input_path = Path(input_file)
 
-    for sheet_name, sheet_df in sheets.items():
-        df = sheet_df.copy()
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input file does not exist: {input_path.resolve()}")
+
+    sheets = pd.read_excel(input_path, sheet_name=None)
+
+    loaded_frames = []
+
+    for sheet_name, raw_df in sheets.items():
+        df = raw_df.copy()
         df.columns = [str(c) for c in df.columns]
 
         resolved, missing = resolve_columns(df.columns, COLUMN_ALIASES)
@@ -292,24 +247,31 @@ def load_excel_data(input_file):
             print(f"[skip] Sheet '{sheet_name}' missing keys: {missing}")
             continue
 
-        selected_raw_columns = [resolved[c] for c in CANONICAL_COLUMNS]
-        out = df.loc[:, selected_raw_columns].copy()
-        out.columns = CANONICAL_COLUMNS
-        out["_sheet"] = sheet_name
+        selected_columns = [resolved[c] for c in CANONICAL_COLUMNS]
 
-        loaded.append(out)
+        sheet_out = df.loc[:, selected_columns].copy()
+        sheet_out.columns = CANONICAL_COLUMNS
+        sheet_out["_sheet"] = str(sheet_name)
+
+        loaded_frames.append(sheet_out)
 
         print(
             f"[ok] Sheet '{sheet_name}' | "
+            f"deal='{resolved['deal']}', "
+            f"date='{resolved['date']}', "
+            f"collat_bal='{resolved['collat_bal']}', "
             f"dlq90='{resolved['dlq90']}', "
             f"cpr='{resolved['cpr']}', "
             f"cdr='{resolved['cdr']}'"
         )
 
-    if not loaded:
-        raise ValueError("No sheets were successfully loaded. Check required columns and aliases.")
+    if not loaded_frames:
+        raise ValueError(
+            "No sheets were loaded. Every sheet was skipped because required columns "
+            "could not be resolved."
+        )
 
-    all_df = pd.concat(loaded, ignore_index=True)
+    all_df = pd.concat(loaded_frames, ignore_index=True)
 
     all_df["date"] = pd.to_datetime(all_df["date"], errors="coerce")
     all_df["deal"] = all_df["deal"].astype(str).str.strip()
@@ -317,11 +279,26 @@ def load_excel_data(input_file):
     for col in ["collat_bal", "dlq90", "cpr", "cdr"]:
         all_df[col] = pd.to_numeric(all_df[col], errors="coerce")
 
+    before_rows = len(all_df)
+
     all_df = all_df.dropna(subset=["date", "deal"])
     all_df = all_df[all_df["deal"].str.len() > 0]
+    all_df = all_df[all_df["deal"].str.lower() != "nan"]
+
+    after_rows = len(all_df)
+
+    if after_rows == 0:
+        raise ValueError(
+            "Data was loaded, but all rows were removed after cleaning. "
+            "Most likely the resolved date column could not be parsed as dates, "
+            "or the deal column is blank."
+        )
+
     all_df = all_df.sort_values(["deal", "date"]).reset_index(drop=True)
 
-    print(f"Total deals loaded: {all_df['deal'].nunique()}")
+    print(f"Rows before cleaning: {before_rows:,}")
+    print(f"Rows after cleaning: {after_rows:,}")
+    print(f"Total deals loaded: {all_df['deal'].nunique():,}")
 
     return all_df
 
@@ -332,13 +309,13 @@ def load_excel_data(input_file):
 
 def detect_frequency(dates, values):
     """
-    Detect monthly vs quarterly metric frequency.
-
-    Uses only dates where the metric value is non-null.
-    Returns:
-      - "quarterly" if median gap > 60 days
-      - "monthly" if median gap <= 60 days
-      - "unknown" if fewer than 3 non-null points
+    Extract dates where values are non-null.
+    Sort them.
+    Compute day gaps.
+    Return:
+      - quarterly if median gap > 60 days
+      - monthly if median gap <= 60 days
+      - unknown if fewer than 3 non-null points
     """
     temp = pd.DataFrame({"date": dates, "value": values})
     temp = temp.dropna(subset=["date", "value"]).sort_values("date")
@@ -364,6 +341,21 @@ def detect_frequency(dates, values):
 # ============================================================
 
 def build_index(df):
+    required = ["deal", "date", "collat_bal", "dlq90", "cpr", "cdr"]
+
+    missing = [c for c in required if c not in df.columns]
+
+    if missing:
+        raise KeyError(
+            f"Cannot build index. Missing columns: {missing}. "
+            f"Available columns: {list(df.columns)}"
+        )
+
+    output_columns = ["deal", "date", "collat_bal", "dlq90", "cpr", "cdr", "_sheet"]
+
+    source_deal_count = int(df["deal"].dropna().nunique())
+    all_dates = sorted(pd.Series(df["date"].dropna().unique()).tolist())
+
     rows = []
     coverage = {
         "dlq90": [],
@@ -371,87 +363,97 @@ def build_index(df):
         "cdr": [],
     }
 
-    source_deal_count = df["deal"].nunique()
-    all_dates = sorted(df["date"].dropna().unique())
-
     for dt in all_dates:
         day = df[df["date"] == dt]
 
         row = {
             "deal": INDEX_DEAL_NAME,
             "date": dt,
-            "_sheet": "INDEX",
             "collat_bal": day["collat_bal"].dropna().sum(),
+            "dlq90": np.nan,
+            "cpr": np.nan,
+            "cdr": np.nan,
+            "_sheet": "INDEX",
         }
 
         for metric in ["dlq90", "cpr", "cdr"]:
-            valid = day[[metric, "collat_bal"]].dropna()
+            valid = day.dropna(subset=[metric, "collat_bal"]).copy()
+
+            valid = valid[valid["collat_bal"] != 0]
 
             if valid.empty or valid["collat_bal"].sum() == 0:
                 row[metric] = np.nan
                 coverage[metric].append(0)
             else:
-                row[metric] = (
+                weighted_value = (
                     valid[metric].mul(valid["collat_bal"]).sum()
                     / valid["collat_bal"].sum()
                 )
-                coverage[metric].append(valid["deal"].nunique())
+
+                row[metric] = weighted_value
+                coverage[metric].append(int(valid["deal"].nunique()))
 
         rows.append(row)
 
-    index_df = pd.DataFrame(rows)
+    index_df = pd.DataFrame(rows, columns=output_columns)
 
     print("Index build summary:")
-    print(f"  Source deals: {source_deal_count}")
-    print(f"  Date points: {len(index_df)}")
+    print(f"  Source deals: {source_deal_count:,}")
+    print(f"  Date points: {len(index_df):,}")
 
     for metric in ["dlq90", "cpr", "cdr"]:
         counts = pd.Series(coverage[metric], dtype="float64")
 
-        avg_cov = counts.mean() if len(counts) else np.nan
-        min_cov = counts.min() if len(counts) else np.nan
-        max_cov = counts.max() if len(counts) else np.nan
+        if counts.empty:
+            print(f"  {metric}: avg=0.00, min=0, max=0 deals per period")
+        else:
+            print(
+                f"  {metric}: "
+                f"avg={counts.mean():.2f}, "
+                f"min={counts.min():.0f}, "
+                f"max={counts.max():.0f} deals per period"
+            )
 
-        print(
-            f"  {metric}: "
-            f"avg={avg_cov:.2f}, "
-            f"min={min_cov:.0f}, "
-            f"max={max_cov:.0f} deals per period"
+    if index_df.empty:
+        raise ValueError(
+            "Index could not be built because there are no valid date points."
         )
 
     return index_df
 
 
 # ============================================================
-# Stats and figures
+# Stats
 # ============================================================
 
 def stats_for_deal(deal_df):
     stats = {
         "_meta": {
             "n_obs": int(len(deal_df)),
-            "start_date": deal_df["date"].min().isoformat() if len(deal_df) else None,
-            "end_date": deal_df["date"].max().isoformat() if len(deal_df) else None,
+            "start_date": None,
+            "end_date": None,
         }
     }
 
-    for metric, cfg in METRICS.items():
-        values = deal_df[metric]
+    if not deal_df.empty:
+        stats["_meta"]["start_date"] = pd.Timestamp(deal_df["date"].min()).isoformat()
+        stats["_meta"]["end_date"] = pd.Timestamp(deal_df["date"].max()).isoformat()
 
+    for metric, cfg in METRICS.items():
         if metric == "collat_bal":
             frequency = "monthly"
         else:
-            frequency = detect_frequency(deal_df["date"], values)
+            frequency = detect_frequency(deal_df["date"], deal_df[metric])
 
-        non_null = values.dropna()
+        non_null = deal_df[metric].dropna()
 
         if non_null.empty:
             latest_value = None
             min_value = None
             max_value = None
         else:
-            latest_idx = values.last_valid_index()
-            latest_value = float(values.loc[latest_idx])
+            latest_idx = deal_df[metric].last_valid_index()
+            latest_value = float(deal_df.loc[latest_idx, metric])
             min_value = float(non_null.min())
             max_value = float(non_null.max())
 
@@ -460,7 +462,7 @@ def stats_for_deal(deal_df):
             "unit": cfg["unit"],
             "icon": cfg["icon"],
             "color": cfg["color"],
-            "is_percent": cfg["is_percent"],
+            "is_percent": bool(cfg["is_percent"]),
             "frequency": frequency,
             "latest": latest_value,
             "min": min_value,
@@ -470,9 +472,11 @@ def stats_for_deal(deal_df):
     return stats
 
 
+# ============================================================
+# Plotly figures
+# ============================================================
+
 def add_monthly_area_trace(fig, deal_df, metric, cfg):
-    row = cfg["row"]
-    col = cfg["col"]
     color = cfg["color"]
 
     fig.add_trace(
@@ -483,7 +487,7 @@ def add_monthly_area_trace(fig, deal_df, metric, cfg):
             name=cfg["label"],
             line={
                 "color": color,
-                "width": 2.5,
+                "width": 2.4,
                 "shape": "spline",
                 "smoothing": 0.4,
             },
@@ -492,8 +496,8 @@ def add_monthly_area_trace(fig, deal_df, metric, cfg):
             connectgaps=False,
             hovertemplate="%{x|%b %Y}<br>%{y:,.2f}<extra></extra>",
         ),
-        row=row,
-        col=col,
+        row=cfg["row"],
+        col=cfg["col"],
     )
 
     non_null = deal_df.dropna(subset=[metric])
@@ -518,16 +522,13 @@ def add_monthly_area_trace(fig, deal_df, metric, cfg):
                 showlegend=False,
                 hovertemplate="Latest<br>%{x|%b %Y}<br>%{y:,.2f}<extra></extra>",
             ),
-            row=row,
-            col=col,
+            row=cfg["row"],
+            col=cfg["col"],
         )
 
 
 def add_quarterly_bar_trace(fig, deal_df, metric, cfg):
-    row = cfg["row"]
-    col = cfg["col"]
     color = cfg["color"]
-
     q_df = deal_df.dropna(subset=[metric])
 
     fig.add_trace(
@@ -544,20 +545,24 @@ def add_quarterly_bar_trace(fig, deal_df, metric, cfg):
             },
             hovertemplate="%{x|%b %Y}<br>%{y:,.2f}<extra></extra>",
         ),
-        row=row,
-        col=col,
+        row=cfg["row"],
+        col=cfg["col"],
     )
 
 
-def build_figure(deal_df, deal_name):
+def build_figure(deal_df):
+    deal_df = deal_df.sort_values("date").reset_index(drop=True)
+
     stats = stats_for_deal(deal_df)
 
     subplot_titles = []
 
     for metric, cfg in METRICS.items():
         title = cfg["label"]
+
         if stats[metric]["frequency"] == "quarterly":
             title += " [Q]"
+
         subplot_titles.append(title)
 
     fig = make_subplots(
@@ -568,8 +573,7 @@ def build_figure(deal_df, deal_name):
         horizontal_spacing=0.09,
     )
 
-    # First invisible trace exists so JS can use fig.data[0].x.length
-    # as requested for observation count.
+    # Invisible trace so JS can use fig.data[0].x.length.
     fig.add_trace(
         go.Scatter(
             x=deal_df["date"],
@@ -598,11 +602,11 @@ def build_figure(deal_df, deal_name):
 
     grid_color = "#1e2d3d"
 
-    for r in [1, 2]:
-        for c in [1, 2]:
+    for row in [1, 2]:
+        for col in [1, 2]:
             fig.update_xaxes(
-                row=r,
-                col=c,
+                row=row,
+                col=col,
                 showgrid=True,
                 gridcolor=grid_color,
                 zeroline=False,
@@ -616,8 +620,8 @@ def build_figure(deal_df, deal_name):
             )
 
             fig.update_yaxes(
-                row=r,
-                col=c,
+                row=row,
+                col=col,
                 showgrid=True,
                 gridcolor=grid_color,
                 zeroline=False,
@@ -644,7 +648,6 @@ def build_figure(deal_df, deal_name):
                 tickformat=",.3s",
             )
 
-    # Style subplot titles.
     for i, ann in enumerate(fig.layout.annotations):
         metric = list(METRICS.keys())[i]
         is_quarterly = stats[metric]["frequency"] == "quarterly"
@@ -681,29 +684,21 @@ def build_figure(deal_df, deal_name):
         bargap=0.25,
     )
 
-    return fig, stats
+    fig_json = fig.to_plotly_json()
+
+    return fig_json, stats
 
 
 # ============================================================
-# HTML generation
+# HTML
 # ============================================================
-
-def safe_json_dumps(obj):
-    s = json.dumps(
-        clean_for_json(obj),
-        cls=PlotlyJSONEncoder,
-        ensure_ascii=False,
-        allow_nan=False,
-    )
-    return s.replace("</", "<\\/")
-
 
 def build_html(all_deals, all_figures, all_stats):
-    all_deals_json = safe_json_dumps(all_deals)
-    all_figures_json = safe_json_dumps(all_figures)
-    all_stats_json = safe_json_dumps(all_stats)
+    all_deals_json = dumps_js(all_deals)
+    all_figures_json = dumps_js(all_figures)
+    all_stats_json = dumps_js(all_stats)
 
-    html_template = r"""
+    html_text = f"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -718,7 +713,7 @@ def build_html(all_deals, all_figures, all_stats):
   <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
 
   <style>
-    :root {
+    :root {{
       --bg: #0b0f1a;
       --surf: #111827;
       --surf2: #1a2235;
@@ -730,14 +725,14 @@ def build_html(all_deals, all_figures, all_stats):
       --text: #e2e8f0;
       --dim: #64748b;
       --grid: #1e2d3d;
-    }
+    }}
 
-    * {
+    * {{
       box-sizing: border-box;
-    }
+    }}
 
     html,
-    body {
+    body {{
       width: 100%;
       height: 100%;
       margin: 0;
@@ -745,15 +740,15 @@ def build_html(all_deals, all_figures, all_stats):
       background: var(--bg);
       color: var(--text);
       font-family: "DM Mono", monospace;
-    }
+    }}
 
-    body {
+    body {{
       display: grid;
       grid-template-columns: 260px 1fr;
       height: 100vh;
-    }
+    }}
 
-    .sidebar {
+    .sidebar {{
       height: 100vh;
       overflow: hidden;
       background: var(--surf);
@@ -762,27 +757,27 @@ def build_html(all_deals, all_figures, all_stats):
       display: flex;
       flex-direction: column;
       gap: 14px;
-    }
+    }}
 
-    .brand {
+    .brand {{
       padding: 2px 4px 8px;
-    }
+    }}
 
-    .brand-title {
+    .brand-title {{
       font-family: "Syne", sans-serif;
       font-weight: 800;
       font-size: 22px;
       line-height: 1.05;
       letter-spacing: -0.04em;
-    }
+    }}
 
-    .brand-subtitle {
+    .brand-subtitle {{
       margin-top: 6px;
       color: var(--dim);
       font-size: 12px;
-    }
+    }}
 
-    .search {
+    .search {{
       width: 100%;
       border: 1px solid var(--border);
       background: var(--surf2);
@@ -792,20 +787,20 @@ def build_html(all_deals, all_figures, all_stats):
       font-family: "DM Mono", monospace;
       font-size: 12px;
       outline: none;
-    }
+    }}
 
-    .search:focus {
+    .search:focus {{
       border-color: var(--a1);
       box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.12);
-    }
+    }}
 
-    .count-line {
+    .count-line {{
       color: var(--dim);
       font-size: 11px;
       padding: 0 4px;
-    }
+    }}
 
-    .deal-list {
+    .deal-list {{
       overflow-y: auto;
       overflow-x: hidden;
       min-height: 0;
@@ -813,18 +808,18 @@ def build_html(all_deals, all_figures, all_stats):
       display: flex;
       flex-direction: column;
       gap: 8px;
-    }
+    }}
 
-    .deal-list::-webkit-scrollbar {
+    .deal-list::-webkit-scrollbar {{
       width: 6px;
-    }
+    }}
 
-    .deal-list::-webkit-scrollbar-thumb {
+    .deal-list::-webkit-scrollbar-thumb {{
       background: var(--border);
       border-radius: 999px;
-    }
+    }}
 
-    .deal-btn {
+    .deal-btn {{
       width: 100%;
       border: 1px solid transparent;
       background: rgba(26, 34, 53, 0.62);
@@ -839,40 +834,40 @@ def build_html(all_deals, all_figures, all_stats):
       white-space: nowrap;
       text-overflow: ellipsis;
       transition: all 0.16s ease;
-    }
+    }}
 
-    .deal-btn:hover {
+    .deal-btn:hover {{
       background: var(--surf2);
       color: var(--text);
-    }
+    }}
 
-    .deal-btn.active {
+    .deal-btn.active {{
       border-color: var(--a1);
       color: var(--a1);
       background: rgba(56, 189, 248, 0.08);
-    }
+    }}
 
-    .index-btn {
+    .index-btn {{
       border-color: rgba(167, 139, 250, 0.48);
       color: var(--a4);
       background: rgba(167, 139, 250, 0.12);
       font-weight: 500;
-    }
+    }}
 
-    .index-btn.active {
+    .index-btn.active {{
       border-color: var(--a4);
       color: var(--text);
       background: rgba(167, 139, 250, 0.2);
-    }
+    }}
 
-    .divider {
+    .divider {{
       height: 1px;
       background: var(--border);
       margin: 2px 0 4px;
       flex: 0 0 auto;
-    }
+    }}
 
-    .main {
+    .main {{
       height: 100vh;
       overflow: hidden;
       padding: 22px;
@@ -880,17 +875,17 @@ def build_html(all_deals, all_figures, all_stats):
       flex-direction: column;
       gap: 16px;
       min-width: 0;
-    }
+    }}
 
-    .topbar {
+    .topbar {{
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 16px;
       flex: 0 0 auto;
-    }
+    }}
 
-    .deal-title {
+    .deal-title {{
       font-family: "Syne", sans-serif;
       font-weight: 800;
       font-size: 28px;
@@ -899,17 +894,17 @@ def build_html(all_deals, all_figures, all_stats):
       overflow: hidden;
       white-space: nowrap;
       text-overflow: ellipsis;
-    }
+    }}
 
-    .top-meta {
+    .top-meta {{
       display: flex;
       align-items: center;
       justify-content: flex-end;
       gap: 10px;
       flex: 0 0 auto;
-    }
+    }}
 
-    .badge {
+    .badge {{
       border: 1px solid rgba(248, 113, 113, 0.45);
       background: rgba(248, 113, 113, 0.12);
       color: var(--a3);
@@ -917,32 +912,32 @@ def build_html(all_deals, all_figures, all_stats):
       padding: 7px 10px;
       font-size: 11px;
       display: none;
-    }
+    }}
 
-    .obs-count {
+    .obs-count {{
       border: 1px solid var(--border);
       background: rgba(17, 24, 39, 0.8);
       color: var(--dim);
       border-radius: 999px;
       padding: 7px 10px;
       font-size: 11px;
-    }
+    }}
 
-    .dashboard {
+    .dashboard {{
       display: none;
       flex-direction: column;
       gap: 16px;
       min-height: 0;
       flex: 1 1 auto;
-    }
+    }}
 
-    .kpis {
+    .kpis {{
       display: flex;
       gap: 12px;
       flex: 0 0 auto;
-    }
+    }}
 
-    .kpi-card {
+    .kpi-card {{
       flex: 1 1 0;
       min-width: 0;
       background: rgba(17, 24, 39, 0.86);
@@ -952,14 +947,14 @@ def build_html(all_deals, all_figures, all_stats):
       box-shadow: 0 16px 40px rgba(0, 0, 0, 0.14);
       position: relative;
       overflow: hidden;
-    }
+    }}
 
-    .kpi-card.quarterly {
+    .kpi-card.quarterly {{
       border-color: rgba(248, 113, 113, 0.46);
       box-shadow: inset 0 0 0 1px rgba(248, 113, 113, 0.07);
-    }
+    }}
 
-    .kpi-head {
+    .kpi-head {{
       display: flex;
       justify-content: space-between;
       align-items: center;
@@ -967,37 +962,37 @@ def build_html(all_deals, all_figures, all_stats):
       color: var(--dim);
       font-size: 11px;
       margin-bottom: 10px;
-    }
+    }}
 
-    .kpi-label {
+    .kpi-label {{
       overflow: hidden;
       white-space: nowrap;
       text-overflow: ellipsis;
-    }
+    }}
 
-    .kpi-icon {
+    .kpi-icon {{
       font-size: 13px;
-    }
+    }}
 
-    .kpi-value {
+    .kpi-value {{
       font-size: 22px;
       font-weight: 500;
       color: var(--text);
       overflow: hidden;
       white-space: nowrap;
       text-overflow: ellipsis;
-    }
+    }}
 
-    .kpi-range {
+    .kpi-range {{
       margin-top: 9px;
       color: var(--dim);
       font-size: 11px;
       overflow: hidden;
       white-space: nowrap;
       text-overflow: ellipsis;
-    }
+    }}
 
-    .q-tag {
+    .q-tag {{
       display: inline-flex;
       align-items: center;
       border: 1px solid rgba(248, 113, 113, 0.45);
@@ -1007,9 +1002,9 @@ def build_html(all_deals, all_figures, all_stats):
       padding: 3px 7px;
       font-size: 10px;
       margin-left: 7px;
-    }
+    }}
 
-    .chart-wrap {
+    .chart-wrap {{
       flex: 1 1 auto;
       min-height: 0;
       background: rgba(17, 24, 39, 0.48);
@@ -1017,44 +1012,44 @@ def build_html(all_deals, all_figures, all_stats):
       border-radius: 22px;
       padding: 12px;
       overflow: hidden;
-    }
+    }}
 
-    #plot {
+    #plot {{
       width: 100%;
       height: 100%;
-    }
+    }}
 
-    .empty {
+    .empty {{
       height: 100%;
       display: flex;
       align-items: center;
       justify-content: center;
       text-align: center;
       color: var(--dim);
-    }
+    }}
 
-    .empty-inner {
+    .empty-inner {{
       transform: translateY(-12px);
-    }
+    }}
 
-    .empty-icon {
+    .empty-icon {{
       font-size: 44px;
       margin-bottom: 14px;
       color: var(--a4);
-    }
+    }}
 
-    .empty-title {
+    .empty-title {{
       font-family: "Syne", sans-serif;
       font-weight: 800;
       font-size: 26px;
       color: var(--text);
       letter-spacing: -0.04em;
-    }
+    }}
 
-    .empty-sub {
+    .empty-sub {{
       margin-top: 8px;
       font-size: 12px;
-    }
+    }}
   </style>
 </head>
 
@@ -1109,60 +1104,60 @@ def build_html(all_deals, all_figures, all_stats):
   </main>
 
   <script>
-    const ALL_DEALS = __ALL_DEALS__;
-    const ALL_FIGURES = __ALL_FIGURES__;
-    const ALL_STATS = __ALL_STATS__;
+    const ALL_DEALS = {all_deals_json};
+    const ALL_FIGURES = {all_figures_json};
+    const ALL_STATS = {all_stats_json};
     const INDEX_DEAL_NAME = "★ INDEX";
 
     let activeDeal = null;
     let currentFilter = "";
 
-    function escapeHtml(value) {
+    function escapeHtml(value) {{
       return String(value)
         .replaceAll("&", "&amp;")
         .replaceAll("<", "&lt;")
         .replaceAll(">", "&gt;")
         .replaceAll('"', "&quot;")
         .replaceAll("'", "&#039;");
-    }
+    }}
 
-    function compactNumber(value) {
-      if (value === null || value === undefined || Number.isNaN(value)) {
+    function compactNumber(value) {{
+      if (value === null || value === undefined || Number.isNaN(value)) {{
         return "—";
-      }
+      }}
 
       const abs = Math.abs(value);
 
-      if (abs >= 1_000_000_000) {
-        return (value / 1_000_000_000).toFixed(2) + "B";
-      }
+      if (abs >= 1000000000) {{
+        return (value / 1000000000).toFixed(2) + "B";
+      }}
 
-      if (abs >= 1_000_000) {
-        return (value / 1_000_000).toFixed(2) + "M";
-      }
+      if (abs >= 1000000) {{
+        return (value / 1000000).toFixed(2) + "M";
+      }}
 
-      if (abs >= 1_000) {
-        return (value / 1_000).toFixed(2) + "K";
-      }
+      if (abs >= 1000) {{
+        return (value / 1000).toFixed(2) + "K";
+      }}
 
-      return value.toLocaleString(undefined, {
+      return value.toLocaleString(undefined, {{
         maximumFractionDigits: 2
-      });
-    }
+      }});
+    }}
 
-    function formatMetric(value, isPercent) {
-      if (value === null || value === undefined || Number.isNaN(value)) {
+    function formatMetric(value, isPercent) {{
+      if (value === null || value === undefined || Number.isNaN(value)) {{
         return "—";
-      }
+      }}
 
-      if (isPercent) {
-        return value.toFixed(1) + "%";
-      }
+      if (isPercent) {{
+        return Number(value).toFixed(1) + "%";
+      }}
 
-      return compactNumber(value);
-    }
+      return compactNumber(Number(value));
+    }}
 
-    function buildSidebar(deals) {
+    function buildSidebar(deals) {{
       const indexButton = document.getElementById("indexButton");
       const list = document.getElementById("dealList");
       const dealCount = document.getElementById("dealCount");
@@ -1186,33 +1181,33 @@ def build_html(all_deals, all_figures, all_stats):
 
       list.innerHTML = "";
 
-      filteredDeals.forEach(deal => {
+      filteredDeals.forEach(deal => {{
         const btn = document.createElement("button");
         btn.className = "deal-btn";
         btn.textContent = deal;
         btn.title = deal;
         btn.onclick = () => selectDeal(deal);
 
-        if (deal === activeDeal) {
+        if (deal === activeDeal) {{
           btn.classList.add("active");
-        }
+        }}
 
         list.appendChild(btn);
-      });
-    }
+      }});
+    }}
 
-    function filterDeals(q) {
+    function filterDeals(q) {{
       currentFilter = q || "";
       buildSidebar(ALL_DEALS);
-    }
+    }}
 
-    function renderKpis(deal) {
+    function renderKpis(deal) {{
       const stats = ALL_STATS[deal];
       const container = document.getElementById("kpis");
 
       const order = ["dlq90", "cpr", "cdr", "collat_bal"];
 
-      container.innerHTML = order.map(metric => {
+      container.innerHTML = order.map(metric => {{
         const s = stats[metric];
         const isQuarterly = s.frequency === "quarterly";
 
@@ -1223,22 +1218,22 @@ def build_html(all_deals, all_figures, all_stats):
         const qTag = isQuarterly ? `<span class="q-tag">Q</span>` : "";
 
         return `
-          <div class="kpi-card ${isQuarterly ? "quarterly" : ""}">
+          <div class="kpi-card ${{isQuarterly ? "quarterly" : ""}}">
             <div class="kpi-head">
               <div>
-                <span class="kpi-icon" style="color:${s.color}">${escapeHtml(s.icon)}</span>
-                <span class="kpi-label">${escapeHtml(s.label)}</span>
-                ${qTag}
+                <span class="kpi-icon" style="color:${{s.color}}">${{escapeHtml(s.icon)}}</span>
+                <span class="kpi-label">${{escapeHtml(s.label)}}</span>
+                ${{qTag}}
               </div>
             </div>
-            <div class="kpi-value">${escapeHtml(latest)}</div>
-            <div class="kpi-range">min ${escapeHtml(minValue)} / max ${escapeHtml(maxValue)}</div>
+            <div class="kpi-value">${{escapeHtml(latest)}}</div>
+            <div class="kpi-range">min ${{escapeHtml(minValue)}} / max ${{escapeHtml(maxValue)}}</div>
           </div>
         `;
-      }).join("");
-    }
+      }}).join("");
+    }}
 
-    function selectDeal(deal) {
+    function selectDeal(deal) {{
       activeDeal = deal;
       buildSidebar(ALL_DEALS);
 
@@ -1250,9 +1245,13 @@ def build_html(all_deals, all_figures, all_stats):
 
       document.getElementById("dealTitle").textContent = deal;
 
-      const observationCount = fig.data && fig.data.length > 0 && fig.data[0].x
-        ? fig.data[0].x.length
-        : stats._meta.n_obs;
+      const observationCount =
+        fig &&
+        fig.data &&
+        fig.data.length > 0 &&
+        fig.data[0].x
+          ? fig.data[0].x.length
+          : stats._meta.n_obs;
 
       document.getElementById("obsCount").textContent =
         observationCount.toLocaleString() + " observations";
@@ -1270,33 +1269,32 @@ def build_html(all_deals, all_figures, all_stats):
         "plot",
         fig.data,
         fig.layout,
-        {
+        {{
           responsive: true,
           displayModeBar: false
-        }
+        }}
       );
-    }
+    }}
 
-    window.addEventListener("resize", () => {
+    window.addEventListener("resize", () => {{
       const plot = document.getElementById("plot");
-      if (plot && activeDeal) {
+
+      if (plot && activeDeal) {{
         Plotly.Plots.resize(plot);
-      }
-    });
+      }}
+    }});
 
     buildSidebar(ALL_DEALS);
-    selectDeal(ALL_DEALS[0]);
+
+    if (ALL_DEALS.length > 0) {{
+      selectDeal(ALL_DEALS[0]);
+    }}
   </script>
 </body>
 </html>
 """
 
-    return (
-        html_template
-        .replace("__ALL_DEALS__", all_deals_json)
-        .replace("__ALL_FIGURES__", all_figures_json)
-        .replace("__ALL_STATS__", all_stats_json)
-    )
+    return html_text
 
 
 # ============================================================
@@ -1307,7 +1305,7 @@ df = load_excel_data(INPUT_FILE)
 
 index_df = build_index(df)
 
-combined_df = pd.concat([index_df, df], ignore_index=True)
+combined_df = pd.concat([index_df, df], ignore_index=True, sort=False)
 combined_df = combined_df.sort_values(["deal", "date"]).reset_index(drop=True)
 
 individual_deals = sorted(df["deal"].dropna().unique().tolist())
@@ -1316,14 +1314,14 @@ all_deals = [INDEX_DEAL_NAME] + individual_deals
 all_figures = {}
 all_stats = {}
 
-for deal in all_deals:
-    deal_df = combined_df[combined_df["deal"] == deal].copy()
+for deal_name in all_deals:
+    deal_df = combined_df[combined_df["deal"] == deal_name].copy()
     deal_df = deal_df.sort_values("date").reset_index(drop=True)
 
-    fig, stats = build_figure(deal_df, deal)
+    fig_json, stats = build_figure(deal_df)
 
-    all_figures[deal] = fig.to_plotly_json()
-    all_stats[deal] = stats
+    all_figures[deal_name] = fig_json
+    all_stats[deal_name] = stats
 
 dashboard_html = build_html(all_deals, all_figures, all_stats)
 
