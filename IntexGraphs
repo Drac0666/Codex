@@ -21,6 +21,10 @@ import plotly.io as pio
 from pathlib import Path
 
 
+# Name that appears in the sidebar for the synthetic index entry
+INDEX_DEAL_NAME = "★ INDEX"
+
+
 # ─── Column alias table ───────────────────────────────────────────────────────
 # KEY         -> internal name used everywhere in the script
 # VALUE LIST  -> all acceptable raw column names (case-insensitive, order = priority)
@@ -293,6 +297,57 @@ def build_figure(df_deal, deal_name):
     return fig
 
 
+# ─── Index builder ───────────────────────────────────────────────────────────
+
+def build_index(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build a collat_bal-weighted composite index across all deals, per date.
+
+    Rules:
+    - A deal contributes to a given date only when BOTH the metric AND
+      collat_bal are non-null on that date (avoids distorting the weight).
+    - dlq90 / cpr / cdr  → weighted average:
+          index(date) = sum(metric_i * bal_i) / sum(bal_i)
+    - collat_bal          → total pool balance: sum(bal_i) for all deals
+      that have a non-null balance on that date (regardless of metrics).
+
+    Prints a per-metric coverage summary so you can see how many deals
+    fed into each index point.
+    """
+    rows = []
+    coverage = {m: [] for m in ["dlq90", "cpr", "cdr"]}
+
+    for date, grp in df.groupby("date"):
+        row = {"deal": INDEX_DEAL_NAME, "date": date}
+
+        # Total pool balance
+        bal_valid = grp["collat_bal"].dropna()
+        row["collat_bal"] = float(bal_valid.sum()) if len(bal_valid) else np.nan
+
+        # Weighted average per metric
+        for metric in ["dlq90", "cpr", "cdr"]:
+            sub = grp[["collat_bal", metric]].dropna()          # need both
+            if len(sub) == 0 or sub["collat_bal"].sum() == 0:
+                row[metric] = np.nan
+            else:
+                row[metric] = float(
+                    (sub[metric] * sub["collat_bal"]).sum() / sub["collat_bal"].sum()
+                )
+                coverage[metric].append(len(sub))
+
+        rows.append(row)
+
+    idx_df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
+
+    n_deals = df["deal"].nunique()
+    print(f"\n  [index] {n_deals} source deal(s)  |  {len(idx_df)} date points")
+    for m, counts in coverage.items():
+        if counts:
+            print(f"          {m:10s}  avg {np.mean(counts):.1f} deals/period  "
+                  f"(min {min(counts)}, max {max(counts)})")
+    return idx_df
+
+
 # ─── Stats helper ─────────────────────────────────────────────────────────────
 
 def stats_for_deal(df_deal):
@@ -355,6 +410,13 @@ html,body{{height:100%;background:var(--bg);color:var(--text);font-family:'DM Mo
 }}
 .deal-btn:hover{{background:var(--surf2);border-color:var(--border);color:var(--text)}}
 .deal-btn.active{{background:rgba(56,189,248,.12);border-color:var(--a1);color:var(--a1);font-weight:500}}
+.deal-btn.index-btn{{
+  color:var(--a4);border-color:rgba(167,139,250,.25);background:rgba(167,139,250,.05);
+  font-weight:500;letter-spacing:.04em;margin-bottom:10px;
+}}
+.deal-btn.index-btn:hover{{background:rgba(167,139,250,.12);border-color:var(--a4);color:var(--a4)}}
+.deal-btn.index-btn.active{{background:rgba(167,139,250,.15);border-color:var(--a4);color:var(--a4)}}
+.index-divider{{height:1px;background:var(--border);margin:0 4px 10px;opacity:.6}}
 .deal-count{{padding:0 14px 10px;font-size:.68rem;color:var(--dim);letter-spacing:.05em}}
 .main{{display:flex;flex-direction:column;overflow:hidden;background:var(--bg)}}
 .topbar{{display:flex;align-items:center;gap:14px;padding:14px 24px;border-bottom:1px solid var(--border);flex-shrink:0}}
@@ -431,13 +493,28 @@ const ALL_DEALS   = {deals_json};
 const ALL_FIGURES = {figures_json};
 const ALL_STATS   = {stats_json};
 const CHART_DEFS  = {chart_defs_json};
+const INDEX_NAME  = {index_name_json};
 
 let currentDeal = null;
 
 function buildSidebar(deals) {{
   const list = document.getElementById('deal-list');
   list.innerHTML = '';
-  deals.forEach(d => {{
+
+  // Always pin INDEX at the top regardless of search filter
+  if (ALL_DEALS.includes(INDEX_NAME)) {{
+    const btn = document.createElement('button');
+    btn.className = 'deal-btn index-btn' + (currentDeal === INDEX_NAME ? ' active' : '');
+    btn.textContent = INDEX_NAME;
+    btn.dataset.deal = INDEX_NAME;
+    btn.onclick = () => selectDeal(INDEX_NAME);
+    list.appendChild(btn);
+    const div = document.createElement('div');
+    div.className = 'index-divider';
+    list.appendChild(div);
+  }}
+
+  deals.filter(d => d !== INDEX_NAME).forEach(d => {{
     const btn = document.createElement('button');
     btn.className = 'deal-btn' + (d === currentDeal ? ' active' : '');
     btn.textContent = d;
@@ -446,7 +523,7 @@ function buildSidebar(deals) {{
     list.appendChild(btn);
   }});
   document.getElementById('deal-count').textContent =
-    deals.length + ' deal' + (deals.length !== 1 ? 's' : '');
+    (deals.filter(d => d !== INDEX_NAME).length) + ' deals';
 }}
 
 function filterDeals(q) {{
@@ -523,10 +600,19 @@ print(f"\n  {len(deals)} deal(s) loaded: {deals[:6]}{'...' if len(deals) > 6 els
 figures_dict = {}
 stats_dict   = {}
 
+# Build individual deal charts
 for deal in deals:
     df_d = df[df["deal"] == deal].copy()
     figures_dict[deal] = json.loads(pio.to_json(build_figure(df_d, deal)))
     stats_dict[deal]   = stats_for_deal(df_d)
+
+# Build weighted index and add as a synthetic entry at the top
+df_index = build_index(df)
+figures_dict[INDEX_DEAL_NAME] = json.loads(pio.to_json(build_figure(df_index, INDEX_DEAL_NAME)))
+stats_dict[INDEX_DEAL_NAME]   = stats_for_deal(df_index)
+
+# Index goes first in the list, then sorted deals
+all_entries = [INDEX_DEAL_NAME] + deals
 
 chart_defs_js = [
     {"col": cd["col"], "label": cd["label"], "unit": cd["unit"], "icon": cd["icon"]}
@@ -535,13 +621,14 @@ chart_defs_js = [
 
 html = HTML_TEMPLATE.format(
     **PALETTE,
-    deals_json      = json.dumps(deals),
+    deals_json      = json.dumps(all_entries),
     figures_json    = json.dumps(figures_dict),
     stats_json      = json.dumps(stats_dict),
     chart_defs_json = json.dumps(chart_defs_js),
+    index_name_json = json.dumps(INDEX_DEAL_NAME),
 )
 
 out_path = Path(OUTPUT_FILE)
 out_path.write_text(html, encoding="utf-8")
-print(f"  Dashboard saved: {out_path.resolve()}")
+print(f"\n  Dashboard saved: {out_path.resolve()}")
 print(f"  Open in any modern browser - no server required.\n")
